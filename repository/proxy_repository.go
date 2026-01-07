@@ -249,3 +249,95 @@ func (p *RepositoryProxy) Invoke(ctx context.Context, methodName string, args ..
 
 	return result, err
 }
+
+// Additional methods for search-service
+
+// FindByExperimentType finds by experiment type
+func (r *DynamicRepository[T]) FindByExperimentType(ctx context.Context, experimentType string) (*T, error) {
+	result, err := r.ExecuteMethod(ctx, "findByExperimentType", []interface{}{experimentType})
+	if err != nil {
+		return nil, err
+	}
+	if result == nil {
+		return nil, nil
+	}
+	if single, ok := result.(*T); ok {
+		return single, nil
+	}
+	if list, ok := result.([]*T); ok && len(list) > 0 {
+		return list[0], nil
+	}
+	return nil, nil
+}
+
+// FindByExperimentMasterId finds by experiment master ID
+func (r *DynamicRepository[T]) FindByExperimentMasterId(ctx context.Context, experimentMasterId interface{}) (*T, error) {
+	result, err := r.ExecuteMethod(ctx, "findByExperimentMasterId", []interface{}{experimentMasterId})
+	if err != nil {
+		return nil, err
+	}
+	if result == nil {
+		return nil, nil
+	}
+	if single, ok := result.(*T); ok {
+		return single, nil
+	}
+	if list, ok := result.([]*T); ok && len(list) > 0 {
+		return list[0], nil
+	}
+	return nil, nil
+}
+
+// FindByWarehouseIdAndType finds by warehouse ID and type
+func (r *DynamicRepository[T]) FindByWarehouseIdAndType(ctx context.Context, warehouseId interface{}, searchType string) (*T, error) {
+	result, err := r.ExecuteMethod(ctx, "findByWarehouseIdAndType", []interface{}{warehouseId, searchType})
+	if err != nil {
+		return nil, err
+	}
+	if result == nil {
+		return nil, nil
+	}
+	if single, ok := result.(*T); ok {
+		return single, nil
+	}
+	if list, ok := result.([]*T); ok && len(list) > 0 {
+		return list[0], nil
+	}
+	return nil, nil
+}
+
+// FindByWarehouseIdAndTypeAndIsMultiSearch finds by warehouse ID, type, and isMultiSearch
+func (r *DynamicRepository[T]) FindByWarehouseIdAndTypeAndIsMultiSearch(ctx context.Context, warehouseId interface{}, searchType string, isMultiSearch bool) (*T, error) {
+	result, err := r.ExecuteMethod(ctx, "findByWarehouseIdAndTypeAndIsMultiSearch", []interface{}{warehouseId, searchType, isMultiSearch})
+	if err != nil {
+		return nil, err
+	}
+	if result == nil {
+		return nil, nil
+	}
+	if single, ok := result.(*T); ok {
+		return single, nil
+	}
+	if list, ok := result.([]*T); ok && len(list) > 0 {
+		return list[0], nil
+	}
+	return nil, nil
+}
+
+// FindByWarehouseIdAndRequestType finds by warehouse ID and request type
+func (r *DynamicRepository[T]) FindByWarehouseIdAndRequestType(ctx context.Context, warehouseId interface{}, requestType string) (*T, error) {
+	result, err := r.ExecuteMethod(ctx, "findByWarehouseIdAndRequestType", []interface{}{warehouseId, requestType})
+	if err != nil {
+		return nil, err
+	}
+	if result == nil {
+		return nil, nil
+	}
+	if single, ok := result.(*T); ok {
+		return single, nil
+	}
+	if list, ok := result.([]*T); ok && len(list) > 0 {
+		return list[0], nil
+	}
+	return nil, nil
+}

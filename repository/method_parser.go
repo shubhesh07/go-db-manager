@@ -124,7 +124,7 @@ func (mp *MethodParser) extractOrderBy(methodName string) ([]OrderClause, string
 
 	for _, match := range matches {
 		if len(match) >= 2 {
-			field := mp.toSnakeCase(match[1])
+			field := mp.getColumnNameFromField(match[1])
 			direction := "ASC"
 			if len(match) >= 3 && strings.ToUpper(match[2]) == "DESC" {
 				direction = "DESC"
@@ -212,10 +212,31 @@ func (mp *MethodParser) parseClause(clause string, args []interface{}, argIndex 
 
 	clause = strings.TrimSpace(clause)
 
+	// Check for True/False (e.g., ActiveTrue, ActiveFalse)
+	// Must check before other suffixes to avoid false matches
+	clauseLower := strings.ToLower(clause)
+	if strings.HasSuffix(clauseLower, "true") && len(clause) > 4 {
+		field := strings.TrimSuffix(clause, "True")
+		field = strings.TrimSuffix(field, "true")                // Handle both cases
+		part.Field = mp.getColumnNameFromField(field) + "::true" // Use :: as marker
+		part.Operator = "="
+		// We'll set the value to true in buildWhereClause
+		return part, 0, nil
+	}
+
+	if strings.HasSuffix(clauseLower, "false") && len(clause) > 5 {
+		field := strings.TrimSuffix(clause, "False")
+		field = strings.TrimSuffix(field, "false")                // Handle both cases
+		part.Field = mp.getColumnNameFromField(field) + "::false" // Use :: as marker
+		part.Operator = "="
+		// We'll set the value to false in buildWhereClause
+		return part, 0, nil
+	}
+
 	// Check for IsNull/IsNotNull
 	if strings.HasSuffix(strings.ToLower(clause), "isnull") {
 		field := strings.TrimSuffix(clause, "IsNull")
-		part.Field = mp.toSnakeCase(field)
+		part.Field = mp.getColumnNameFromField(field)
 		part.IsNull = true
 		part.Operator = "IS NULL"
 		return part, 0, nil
@@ -223,7 +244,7 @@ func (mp *MethodParser) parseClause(clause string, args []interface{}, argIndex 
 
 	if strings.HasSuffix(strings.ToLower(clause), "isnotnull") {
 		field := strings.TrimSuffix(clause, "IsNotNull")
-		part.Field = mp.toSnakeCase(field)
+		part.Field = mp.getColumnNameFromField(field)
 		part.IsNotNull = true
 		part.Operator = "IS NOT NULL"
 		return part, 0, nil
@@ -232,7 +253,7 @@ func (mp *MethodParser) parseClause(clause string, args []interface{}, argIndex 
 	// Check for NotIn
 	if strings.HasSuffix(strings.ToLower(clause), "notin") {
 		field := strings.TrimSuffix(clause, "NotIn")
-		part.Field = mp.toSnakeCase(field)
+		part.Field = mp.getColumnNameFromField(field)
 		part.Operator = "NOT IN"
 		part.IsNot = true
 		if argIndex < len(args) {
@@ -248,7 +269,7 @@ func (mp *MethodParser) parseClause(clause string, args []interface{}, argIndex 
 	// Check for In
 	if strings.HasSuffix(strings.ToLower(clause), "in") {
 		field := strings.TrimSuffix(clause, "In")
-		part.Field = mp.toSnakeCase(field)
+		part.Field = mp.getColumnNameFromField(field)
 		part.Operator = "IN"
 		if argIndex < len(args) {
 			return part, 1, nil
@@ -281,7 +302,7 @@ func (mp *MethodParser) parseClause(clause string, args []interface{}, argIndex 
 	for opName, opSymbol := range operators {
 		if strings.HasSuffix(clause, opName) {
 			field := strings.TrimSuffix(clause, opName)
-			part.Field = mp.toSnakeCase(field)
+			part.Field = mp.getColumnNameFromField(field)
 			part.Operator = opSymbol
 
 			// Special handling for Like operators
@@ -300,7 +321,7 @@ func (mp *MethodParser) parseClause(clause string, args []interface{}, argIndex 
 	}
 
 	// Default: equality
-	part.Field = mp.toSnakeCase(clause)
+	part.Field = mp.getColumnNameFromField(clause)
 	part.Operator = "="
 	return part, 1, nil
 }
@@ -420,7 +441,21 @@ func (mp *MethodParser) buildWhereClause(sql *strings.Builder, parts []QueryPart
 				currentArgIndex += 2
 			}
 		} else {
-			if currentArgIndex < len(args) {
+			// Check if this is a True/False clause (no args consumed)
+			fieldName := part.Field
+			if strings.HasSuffix(fieldName, "::true") {
+				// Field name ends with "::true", remove suffix and set value to true
+				fieldName = strings.TrimSuffix(fieldName, "::true")
+				sql.WriteString(fmt.Sprintf("%s %s $%d", fieldName, part.Operator, argIndex))
+				*sqlArgs = append(*sqlArgs, true)
+				argIndex++
+			} else if strings.HasSuffix(fieldName, "::false") {
+				// Field name ends with "::false", remove suffix and set value to false
+				fieldName = strings.TrimSuffix(fieldName, "::false")
+				sql.WriteString(fmt.Sprintf("%s %s $%d", fieldName, part.Operator, argIndex))
+				*sqlArgs = append(*sqlArgs, false)
+				argIndex++
+			} else if currentArgIndex < len(args) {
 				sql.WriteString(fmt.Sprintf("%s %s $%d", part.Field, part.Operator, argIndex))
 				*sqlArgs = append(*sqlArgs, args[currentArgIndex])
 				argIndex++
@@ -442,4 +477,50 @@ func (mp *MethodParser) toSnakeCase(s string) string {
 		result.WriteRune(r)
 	}
 	return strings.ToLower(result.String())
+}
+
+// getColumnNameFromField looks up the column name for a field in the entity
+// It first tries to find the field by name, then uses the struct tag, then falls back to snake_case
+func (mp *MethodParser) getColumnNameFromField(fieldName string) string {
+	if mp.entityType == nil {
+		return mp.toSnakeCase(fieldName)
+	}
+
+	// Try to find the field in the entity
+	t := mp.entityType
+	if t.Kind() == reflect.Ptr {
+		t = t.Elem()
+	}
+
+	// Search for field by name (case-insensitive)
+	for i := 0; i < t.NumField(); i++ {
+		field := t.Field(i)
+		if strings.EqualFold(field.Name, fieldName) {
+			// Found the field, get column name from tag
+			tag := field.Tag.Get("orm")
+			if tag != "" && tag != "-" {
+				// Parse column name from tag
+				parts := strings.Split(tag, ";")
+				for _, part := range parts {
+					part = strings.TrimSpace(part)
+					if strings.HasPrefix(part, "column:") {
+						colName := strings.TrimPrefix(part, "column:")
+						// Remove any additional attributes after column name
+						if idx := strings.Index(colName, ";"); idx >= 0 {
+							colName = colName[:idx]
+						}
+						if idx := strings.Index(colName, " "); idx >= 0 {
+							colName = colName[:idx]
+						}
+						return strings.TrimSpace(colName)
+					}
+				}
+			}
+			// No column tag, use snake_case of field name
+			return mp.toSnakeCase(field.Name)
+		}
+	}
+
+	// Field not found, fall back to snake_case conversion
+	return mp.toSnakeCase(fieldName)
 }
