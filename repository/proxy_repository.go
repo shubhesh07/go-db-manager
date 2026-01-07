@@ -30,6 +30,26 @@ func (r *DynamicRepository[T]) CallMethod(ctx context.Context, methodName string
 // Helper methods for common Spring JPA patterns
 // These can be called directly or used as examples for code generation
 
+// FindByID finds by ID (handles both FindByID and FindById)
+func (r *DynamicRepository[T]) FindByID(ctx context.Context, id interface{}) (*T, error) {
+	// Use "findById" (lowercase 'd') to match the convention
+	// The parser will handle "id" correctly
+	result, err := r.ExecuteMethod(ctx, "findById", []interface{}{id})
+	if err != nil {
+		return nil, err
+	}
+	if result == nil {
+		return nil, sql.ErrNoRows
+	}
+	if single, ok := result.(*T); ok {
+		return single, nil
+	}
+	if list, ok := result.([]*T); ok && len(list) > 0 {
+		return list[0], nil
+	}
+	return nil, sql.ErrNoRows
+}
+
 // FindByOrderId finds by order ID
 func (r *DynamicRepository[T]) FindByOrderId(ctx context.Context, orderId interface{}) (*T, error) {
 	result, err := r.ExecuteMethod(ctx, "findByOrderId", []interface{}{orderId})

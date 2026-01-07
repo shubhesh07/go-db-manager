@@ -97,6 +97,16 @@ func (cm *ConnectionManager) GetDB() *sql.DB {
 	return cm.db
 }
 
+// GetDBType returns the database type
+func (cm *ConnectionManager) GetDBType() DBType {
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+	if cm.config == nil {
+		return PostgreSQL // Default
+	}
+	return cm.config.Type
+}
+
 // Close closes the database connection
 func (cm *ConnectionManager) Close() error {
 	cm.mu.Lock()
