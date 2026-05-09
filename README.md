@@ -334,3 +334,10 @@ MIT License
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
+
+---
+
+## Also by Shubhesh
+
+- **[DB Connect](https://github.com/shubhesh07/db-connect)** — Free desktop database IDE for MySQL, Redshift & DynamoDB. Alternative to DataGrip, DBeaver, TablePlus. ([Download](https://shubhesh07.github.io/db-connect))
+- **[Claude Code Reviewer](https://github.com/shubhesh07/claude-code-reviewer)** — Automated PR/MR code reviews powered by Claude Code CLI. Works with GitHub & GitLab.
