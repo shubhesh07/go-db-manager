@@ -1,36 +1,17 @@
-.PHONY: build test clean run-example
+.PHONY: build test generate vet fmt
 
-# Build the project
 build:
 	go build ./...
 
-# Run tests
 test:
-	go test -v ./...
+	go test ./...
 
-# Run example
-run-example:
-	go run cmd/example/main.go
+vet:
+	go vet ./...
 
-# Clean build artifacts
-clean:
-	go clean
-	rm -f *.test *.out
-
-# Install dependencies
-deps:
-	go mod download
-	go mod tidy
-
-# Format code
 fmt:
-	go fmt ./...
+	gofmt -w .
 
-# Lint code
-lint:
-	golangci-lint run
-
-# Run migrations (example)
-migrate:
-	@echo "Run migrations using your migration tool"
-
+# Regenerate every *_gen.go (needs the //go:generate line in each repository package)
+generate:
+	go generate ./...

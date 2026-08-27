@@ -1,6 +1,6 @@
-# Contributing to go-db-manager
+# Contributing to gojpa
 
-Thank you for your interest in contributing to go-db-manager! This document provides guidelines and instructions for contributing.
+Thank you for your interest in contributing to gojpa! This document provides guidelines and instructions for contributing.
 
 ## Table of Contents
 
@@ -22,12 +22,12 @@ By participating in this project, you agree to abide by our [Code of Conduct](CO
 1. **Fork** the repository on GitHub
 2. **Clone** your fork locally:
    ```bash
-   git clone https://github.com/YOUR-USERNAME/go-db-manager.git
-   cd go-db-manager
+   git clone https://github.com/YOUR-USERNAME/gojpa.git
+   cd gojpa
    ```
 3. **Add the upstream remote**:
    ```bash
-   git remote add upstream https://github.com/shubhesh07/go-db-manager.git
+   git remote add upstream https://github.com/shubhesh07/gojpa.git
    ```
 
 ## Development Setup
@@ -170,4 +170,4 @@ Describe the problem you're trying to solve, not just the solution you have in m
 
 ## Questions?
 
-Open a [GitHub Discussion](https://github.com/shubhesh07/go-db-manager/discussions) for questions and general discussion.
+Open a [GitHub Discussion](https://github.com/shubhesh07/gojpa/discussions) for questions and general discussion.
