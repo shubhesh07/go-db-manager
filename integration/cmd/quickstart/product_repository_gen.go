@@ -30,6 +30,16 @@ func (r *ProductRepositoryImpl) IncludingDeleted() *ProductRepositoryImpl {
 	return &ProductRepositoryImpl{Repository: r.Repository.IncludingDeleted()}
 }
 
+// ProductFields are property names for jpa.Cond / jpa.Sort (compile-checked).
+var ProductFields = struct {
+	ID        string
+	Code      string
+	Name      string
+	Price     string
+	Active    string
+	UpdatedOn string
+}{ID: "ID", Code: "Code", Name: "Name", Price: "Price", Active: "Active", UpdatedOn: "UpdatedOn"}
+
 func (r *ProductRepositoryImpl) CountByPriceLessThan(ctx context.Context, max float64) (int64, error) {
 	return r.CountBy(ctx, "CountByPriceLessThan", max)
 }

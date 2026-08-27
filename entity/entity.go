@@ -175,6 +175,20 @@ func scannable(t reflect.Type) bool {
 	return false
 }
 
+// NewMeta builds metadata without a Go type (used by jpagen -sql, which only
+// has go/types information). Columns need Name and Field.
+func NewMeta(table string, cols []Column) *Meta {
+	m := &Meta{Table: table, Columns: cols, byName: map[string]*Column{}}
+	for i := range m.Columns {
+		c := &m.Columns[i]
+		m.byName[c.Name] = c
+		if c.PK {
+			m.PK = c
+		}
+	}
+	return m
+}
+
 // Column looks a column up by name.
 func (m *Meta) Column(name string) *Column { return m.byName[name] }
 

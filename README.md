@@ -167,6 +167,17 @@ Properties are validated against the entity; `jpa.RawCond("price IS NULL OR pric
 - **Dialects**: `sqlgen.MySQL`, `sqlgen.Postgres`, `sqlgen.SQLite`.
 - **Real-database tests**: `make integration` runs the example repository against SQLite, MySQL 8 and Postgres 16 (Docker).
 
+- **Review the SQL before it runs**: `jpagen -type Repository -sql` prints every method's statement for MySQL and Postgres; `repo.SQL("FindBy…", args)` does the same at runtime.
+- **Keep queries indexed**: `plan, _ := repo.ExplainBy(ctx, "FindByWarehouseId", id); if plan.FullScan { t.Fatal(...) }` — MySQL/Postgres/SQLite `EXPLAIN` normalised.
+- **Fail fast on schema drift**: `repo.Verify(ctx)` at startup runs a zero-row `SELECT` of every mapped column.
+- **Typed property names**: generated `ProductFields.Code` etc. for `jpa.Eq(ProductFields.Code, …)` / `jpa.Asc(ProductFields.Price)` (disable with `-fields=false`).
+- **Find the query in the DB**: `jpa.WithComments()` prefixes `/* Type.Method */` so slow-query logs and `SHOW PROCESSLIST` name the repository method.
+- **Request-scoped filter** (multi-tenancy / warehouse scoping): `ctx = jpa.WithFilter(ctx, jpa.Eq("TenantId", id))` — ANDed into every derived/Cond query on that context.
+- **Read cache** for master data: `jpa.WithCache(jpa.MemoryCache(), 5*time.Minute)`; writes through the repository invalidate it, `InvalidateCache()` for the rest.
+- **Upsert**: `repo.SaveAllUpsert(ctx, rows, "Code")` → `ON DUPLICATE KEY UPDATE` / `ON CONFLICT … DO UPDATE`.
+- **Read replica**: `jpa.WithReplica(replicaDB)` routes plain reads there; locked reads and anything inside `WithTx` stay on the primary.
+- **Keyset over raw queries**: `jpa.SelectWindow[R](ctx, repo, name, sql, jpa.Keyset(100, jpa.Asc("Code")), params)`.
+
 Migrating an existing sqlx/GORM codebase: [`docs/MIGRATION.md`](docs/MIGRATION.md).
 
 ## Runtime

@@ -120,9 +120,86 @@ const batchSize = 500
 type Option func(*config)
 
 type config struct {
-	hooks []Hook
-	name  string
-	retry *RetryPolicy
+	hooks    []Hook
+	name     string
+	retry    *RetryPolicy
+	comments bool
+	replica  Executor
+	cache    *cacheCfg
+}
+
+// WithComments prefixes every statement with "/* Type.Method */" so slow-query
+// logs and SHOW PROCESSLIST show which repository method is running.
+func WithComments() Option { return func(c *config) { c.comments = true } }
+
+// WithReplica sends reads (no row lock, not inside WithTx) to replica.
+func WithReplica(replica Executor) Option { return func(c *config) { c.replica = replica } }
+
+// ---- read cache ----------------------------------------------------------
+
+// CacheStore is a minimal cache; MemoryCache is the built-in one.
+type CacheStore interface {
+	Get(key string) (any, bool)
+	Set(key string, v any, ttl time.Duration)
+	Clear()
+}
+
+type cacheCfg struct {
+	store CacheStore
+	ttl   time.Duration
+}
+
+// WithCache caches derived/Cond SELECT results for ttl, keyed by SQL+args.
+// Any write through the same repository clears the store; call
+// InvalidateCache after writes made elsewhere. Meant for read-mostly master
+// data, not for rows that change under the request.
+func WithCache(store CacheStore, ttl time.Duration) Option {
+	return func(c *config) { c.cache = &cacheCfg{store: store, ttl: ttl} }
+}
+
+type memEntry struct {
+	v   any
+	exp time.Time
+}
+
+type memoryCache struct{ m sync.Map }
+
+// MemoryCache is an in-process CacheStore with per-entry expiry.
+func MemoryCache() CacheStore { return &memoryCache{} }
+
+func (c *memoryCache) Get(key string) (any, bool) {
+	e, ok := c.m.Load(key)
+	if !ok {
+		return nil, false
+	}
+	me := e.(memEntry)
+	if time.Now().After(me.exp) {
+		c.m.Delete(key)
+		return nil, false
+	}
+	return me.v, true
+}
+func (c *memoryCache) Set(key string, v any, ttl time.Duration) {
+	c.m.Store(key, memEntry{v: v, exp: time.Now().Add(ttl)})
+}
+func (c *memoryCache) Clear() { c.m.Range(func(k, _ any) bool { c.m.Delete(k); return true }) }
+
+// ---- request-scoped filter (Hibernate @Filter / multi-tenancy) ------------
+
+type filterKey struct{}
+
+// WithFilter ANDs cond into every derived/Cond query (find, count, exists,
+// window, delete) executed with ctx. Save/Update/raw queries are unaffected.
+func WithFilter(ctx context.Context, cond Cond) context.Context {
+	if prev, ok := ctx.Value(filterKey{}).(Cond); ok {
+		cond = And(prev, cond)
+	}
+	return context.WithValue(ctx, filterKey{}, cond)
+}
+
+func ctxFilter(ctx context.Context) Cond {
+	c, _ := ctx.Value(filterKey{}).(Cond)
+	return c
 }
 
 func WithHook(h Hook) Option   { return func(c *config) { c.hooks = append(c.hooks, h) } }
@@ -236,7 +313,24 @@ func New[T any, ID any](exec Executor, d sqlgen.Dialect, opts ...Option) *Reposi
 func (r *Repository[T, ID]) WithTx(exec Executor) *Repository[T, ID] {
 	c := *r
 	c.exec = exec
+	c.cfg.replica = nil // everything inside a transaction goes to that connection
 	return &c
+}
+
+// InvalidateCache clears the WithCache store (e.g. after writes made
+// outside this repository).
+func (r *Repository[T, ID]) InvalidateCache() {
+	if r.cfg.cache != nil {
+		r.cfg.cache.store.Clear()
+	}
+}
+
+// reader picks the replica for plain reads when configured.
+func (r *Repository[T, ID]) reader(q sqlgen.Query) Executor {
+	if r.cfg.replica != nil && !q.Locked && isRead(q.SQL) {
+		return r.cfg.replica
+	}
+	return r.exec
 }
 
 // IncludingDeleted returns a copy that ignores the entity's SoftDelete filter
@@ -251,7 +345,10 @@ func (r *Repository[T, ID]) Meta() *entity.Meta      { return r.meta }
 func (r *Repository[T, ID]) Dialect() sqlgen.Dialect { return r.d }
 func (r *Repository[T, ID]) Executor() Executor      { return r.exec }
 
-func (r *Repository[T, ID]) run(ctx context.Context, name string, q sqlgen.Query, fn func(ctx context.Context) (int64, error)) (int64, error) {
+func (r *Repository[T, ID]) run(ctx context.Context, name string, q sqlgen.Query, fn func(ctx context.Context, q sqlgen.Query) (int64, error)) (int64, error) {
+	if r.cfg.comments {
+		q.SQL = "/* " + r.cfg.name + "." + name + " */ " + q.SQL
+	}
 	attempts := 1
 	if p := r.cfg.retry; p != nil && p.Attempts > 1 && (p.Writes || isRead(q.SQL)) {
 		attempts = p.Attempts
@@ -279,7 +376,7 @@ func isRead(sql string) bool {
 	return strings.HasPrefix(strings.ToUpper(strings.TrimSpace(sql)), "SELECT")
 }
 
-func (r *Repository[T, ID]) once(ctx context.Context, name string, q sqlgen.Query, fn func(ctx context.Context) (int64, error)) (int64, error) {
+func (r *Repository[T, ID]) once(ctx context.Context, name string, q sqlgen.Query, fn func(ctx context.Context, q sqlgen.Query) (int64, error)) (int64, error) {
 	query := Query{Name: r.cfg.name + "." + name, SQL: q.SQL, Args: q.Args}
 	var dones []func(int64, error)
 	for _, h := range r.cfg.hooks {
@@ -289,7 +386,7 @@ func (r *Repository[T, ID]) once(ctx context.Context, name string, q sqlgen.Quer
 			dones = append(dones, done)
 		}
 	}
-	n, err := fn(ctx)
+	n, err := fn(ctx, q)
 	for i := len(dones) - 1; i >= 0; i-- {
 		dones[i](n, err)
 	}
@@ -297,21 +394,33 @@ func (r *Repository[T, ID]) once(ctx context.Context, name string, q sqlgen.Quer
 }
 
 func (r *Repository[T, ID]) query(ctx context.Context, name string, q sqlgen.Query) ([]T, error) {
+	var key string
+	if c := r.cfg.cache; c != nil && !q.Locked {
+		key = q.SQL + fmt.Sprint(q.Args)
+		if v, ok := c.store.Get(key); ok {
+			return v.([]T), nil
+		}
+	}
 	var out []T
-	_, err := r.run(ctx, name, q, func(ctx context.Context) (int64, error) {
-		rows, err := r.exec.QueryContext(ctx, q.SQL, q.Args...)
+	exec := r.reader(q)
+	_, err := r.run(ctx, name, q, func(ctx context.Context, q sqlgen.Query) (int64, error) {
+		rows, err := exec.QueryContext(ctx, q.SQL, q.Args...)
 		if err != nil {
 			return 0, err
 		}
 		out, err = entity.ScanAll[T](rows)
 		return int64(len(out)), err
 	})
+	if err == nil && key != "" {
+		r.cfg.cache.store.Set(key, out, r.cfg.cache.ttl)
+	}
 	return out, err
 }
 
 func (r *Repository[T, ID]) scalar(ctx context.Context, name string, q sqlgen.Query, dest any) error {
-	_, err := r.run(ctx, name, q, func(ctx context.Context) (int64, error) {
-		rows, err := r.exec.QueryContext(ctx, q.SQL, q.Args...)
+	exec := r.reader(q)
+	_, err := r.run(ctx, name, q, func(ctx context.Context, q sqlgen.Query) (int64, error) {
+		rows, err := exec.QueryContext(ctx, q.SQL, q.Args...)
 		if err != nil {
 			return 0, err
 		}
@@ -325,7 +434,8 @@ func (r *Repository[T, ID]) scalar(ctx context.Context, name string, q sqlgen.Qu
 }
 
 func (r *Repository[T, ID]) execute(ctx context.Context, name string, q sqlgen.Query) (int64, error) {
-	return r.run(ctx, name, q, func(ctx context.Context) (int64, error) {
+	r.InvalidateCache()
+	return r.run(ctx, name, q, func(ctx context.Context, q sqlgen.Query) (int64, error) {
 		res, err := r.exec.ExecContext(ctx, q.SQL, q.Args...)
 		if err != nil {
 			return 0, err
@@ -369,19 +479,122 @@ func (r *Repository[T, ID]) splitSpecial(args []any) ([]any, sqlgen.Options) {
 	return args, opt
 }
 
-func (r *Repository[T, ID]) build(method string, args []any) (*parser.Tree, sqlgen.Query, sqlgen.Options, error) {
+func (r *Repository[T, ID]) build(ctx context.Context, method string, args []any) (*parser.Tree, sqlgen.Query, sqlgen.Options, error) {
 	t, err := r.tree(method)
 	if err != nil {
 		return nil, sqlgen.Query{}, sqlgen.Options{}, err
 	}
 	args, opt := r.splitSpecial(args)
+	opt.Cond = r.withFilter(ctx, opt.Cond)
 	q, err := sqlgen.Build(r.d, r.meta, t, args, opt)
 	return t, q, opt, err
 }
 
+func (r *Repository[T, ID]) withFilter(ctx context.Context, c Cond) Cond {
+	f := ctxFilter(ctx)
+	switch {
+	case f == nil:
+		return c
+	case c == nil:
+		return f
+	}
+	return And(c, f)
+}
+
+// SQL renders the statement a derived method would run, without executing
+// it (for review, logging, EXPLAIN).
+func (r *Repository[T, ID]) SQL(method string, args ...any) (sqlgen.Query, error) {
+	_, q, _, err := r.build(context.Background(), method, args)
+	return q, err
+}
+
+// Plan is a query plan from ExplainBy. FullScan is true when the dialect's
+// EXPLAIN reports a full table scan (MySQL type=ALL, Postgres "Seq Scan",
+// SQLite "SCAN" without an index) — assert on it in tests to keep queries
+// indexed.
+type Plan struct {
+	Rows     []map[string]any
+	FullScan bool
+}
+
+// ExplainBy runs EXPLAIN on a derived method's statement.
+func (r *Repository[T, ID]) ExplainBy(ctx context.Context, method string, args ...any) (Plan, error) {
+	_, q, _, err := r.build(ctx, method, args)
+	if err != nil {
+		return Plan{}, err
+	}
+	return r.explain(ctx, method, q)
+}
+
+func (r *Repository[T, ID]) explain(ctx context.Context, name string, q sqlgen.Query) (Plan, error) {
+	q.SQL = r.d.ExplainPrefix() + q.SQL
+	var plan Plan
+	_, err := r.run(ctx, "explain."+name, q, func(ctx context.Context, q sqlgen.Query) (int64, error) {
+		rows, err := r.exec.QueryContext(ctx, q.SQL, q.Args...)
+		if err != nil {
+			return 0, err
+		}
+		defer rows.Close()
+		cols, err := rows.Columns()
+		if err != nil {
+			return 0, err
+		}
+		for rows.Next() {
+			vals := make([]any, len(cols))
+			ptrs := make([]any, len(cols))
+			for i := range vals {
+				ptrs[i] = &vals[i]
+			}
+			if err := rows.Scan(ptrs...); err != nil {
+				return 0, err
+			}
+			row := map[string]any{}
+			for i, c := range cols {
+				if b, ok := vals[i].([]byte); ok {
+					vals[i] = string(b)
+				}
+				row[c] = vals[i]
+			}
+			plan.Rows = append(plan.Rows, row)
+		}
+		return int64(len(plan.Rows)), rows.Err()
+	})
+	if err != nil {
+		return Plan{}, err
+	}
+	for _, row := range plan.Rows {
+		for _, v := range row {
+			s := strings.ToUpper(fmt.Sprint(v))
+			if s == "ALL" || strings.Contains(s, "SEQ SCAN") || (strings.HasPrefix(s, "SCAN ") && !strings.Contains(s, "USING")) {
+				plan.FullScan = true
+			}
+		}
+	}
+	return plan, nil
+}
+
+// Verify checks that every mapped column exists by running a zero-row
+// SELECT. Call it at startup to fail fast on schema drift.
+func (r *Repository[T, ID]) Verify(ctx context.Context) error {
+	cols := make([]string, len(r.meta.Columns))
+	for i, c := range r.meta.Columns {
+		cols[i] = r.d.Quote(c.Name)
+	}
+	q := sqlgen.Query{SQL: fmt.Sprintf("SELECT %s FROM %s WHERE 1=0", strings.Join(cols, ", "), r.d.Quote(r.meta.Table))}
+	_, err := r.run(ctx, "verify", q, func(ctx context.Context, q sqlgen.Query) (int64, error) {
+		rows, err := r.exec.QueryContext(ctx, q.SQL)
+		if err != nil {
+			return 0, fmt.Errorf("jpa: verify %s: %w", r.meta.Table, err)
+		}
+		defer rows.Close()
+		return 0, rows.Err()
+	})
+	return err
+}
+
 // FindBy runs a derived find method, e.g. FindBy(ctx, "FindByCustomerIdAndStatusIdIn", 7, []int{1,2}).
 func (r *Repository[T, ID]) FindBy(ctx context.Context, method string, args ...any) ([]T, error) {
-	_, q, _, err := r.build(method, args)
+	_, q, _, err := r.build(ctx, method, args)
 	if err != nil {
 		return nil, err
 	}
@@ -391,11 +604,11 @@ func (r *Repository[T, ID]) FindBy(ctx context.Context, method string, args ...a
 // EachBy streams a derived find row by row without loading the result set;
 // fn returning an error stops the iteration. (Spring's Stream<T>.)
 func (r *Repository[T, ID]) EachBy(ctx context.Context, method string, fn func(T) error, args ...any) error {
-	_, q, _, err := r.build(method, args)
+	_, q, _, err := r.build(ctx, method, args)
 	if err != nil {
 		return err
 	}
-	_, err = r.run(ctx, method, q, func(ctx context.Context) (int64, error) {
+	_, err = r.run(ctx, method, q, func(ctx context.Context, q sqlgen.Query) (int64, error) {
 		rows, err := r.exec.QueryContext(ctx, q.SQL, q.Args...)
 		if err != nil {
 			return 0, err
@@ -448,7 +661,7 @@ func (r *Repository[T, ID]) PageBy(ctx context.Context, method string, p Pageabl
 	}
 	ct := *t
 	ct.Verb, ct.Limit, ct.OrderBy, ct.Distinct = parser.Count, 0, nil, false
-	q, err := sqlgen.Build(r.d, r.meta, &ct, args, sqlgen.Options{IncludeDeleted: r.includeDeleted})
+	q, err := sqlgen.Build(r.d, r.meta, &ct, args, sqlgen.Options{IncludeDeleted: r.includeDeleted, Cond: r.withFilter(ctx, nil)})
 	if err != nil {
 		return Page[T]{}, err
 	}
@@ -469,7 +682,7 @@ func (r *Repository[T, ID]) SliceBy(ctx context.Context, method string, p Pageab
 	if err != nil {
 		return Slice[T]{}, err
 	}
-	opt := sqlgen.Options{OrderBy: p.Sort, Limit: p.Size + 1, Offset: p.Page * p.Size, IncludeDeleted: r.includeDeleted}
+	opt := sqlgen.Options{OrderBy: p.Sort, Limit: p.Size + 1, Offset: p.Page * p.Size, IncludeDeleted: r.includeDeleted, Cond: r.withFilter(ctx, nil)}
 	q, err := sqlgen.Build(r.d, r.meta, t, args, opt)
 	if err != nil {
 		return Slice[T]{}, err
@@ -486,7 +699,7 @@ func (r *Repository[T, ID]) SliceBy(ctx context.Context, method string, p Pageab
 }
 
 func (r *Repository[T, ID]) CountBy(ctx context.Context, method string, args ...any) (int64, error) {
-	_, q, _, err := r.build(method, args)
+	_, q, _, err := r.build(ctx, method, args)
 	if err != nil {
 		return 0, err
 	}
@@ -495,7 +708,7 @@ func (r *Repository[T, ID]) CountBy(ctx context.Context, method string, args ...
 }
 
 func (r *Repository[T, ID]) ExistsBy(ctx context.Context, method string, args ...any) (bool, error) {
-	_, q, _, err := r.build(method, args)
+	_, q, _, err := r.build(ctx, method, args)
 	if err != nil {
 		return false, err
 	}
@@ -505,7 +718,7 @@ func (r *Repository[T, ID]) ExistsBy(ctx context.Context, method string, args ..
 
 // DeleteBy runs a derived delete (soft if the entity declares SoftDelete).
 func (r *Repository[T, ID]) DeleteBy(ctx context.Context, method string, args ...any) (int64, error) {
-	_, q, _, err := r.build(method, args)
+	_, q, _, err := r.build(ctx, method, args)
 	if err != nil {
 		return 0, err
 	}
@@ -662,7 +875,7 @@ func (r *Repository[T, ID]) saveAll(ctx context.Context, es []*T) error {
 		q.SQL = fmt.Sprintf("INSERT INTO %s (%s) VALUES %s", r.d.Quote(r.meta.Table), strings.Join(cols, ", "), strings.Join(rows, ", "))
 		if pk != nil && pk.Auto && r.d.Returning() {
 			q.SQL += " RETURNING " + r.d.Quote(pk.Name)
-			_, err := r.run(ctx, "save", q, func(ctx context.Context) (int64, error) {
+			_, err := r.run(ctx, "save", q, func(ctx context.Context, q sqlgen.Query) (int64, error) {
 				rs, err := r.exec.QueryContext(ctx, q.SQL, q.Args...)
 				if err != nil {
 					return 0, err
@@ -680,7 +893,7 @@ func (r *Repository[T, ID]) saveAll(ctx context.Context, es []*T) error {
 			}
 			continue
 		}
-		_, err := r.run(ctx, "save", q, func(ctx context.Context) (int64, error) {
+		_, err := r.run(ctx, "save", q, func(ctx context.Context, q sqlgen.Query) (int64, error) {
 			res, err := r.exec.ExecContext(ctx, q.SQL, q.Args...)
 			if err != nil {
 				return 0, err
@@ -707,6 +920,49 @@ func (r *Repository[T, ID]) saveAll(ctx context.Context, es []*T) error {
 // ErrOptimisticLock is returned by Update when the entity has an
 // orm:"version" column and the row's version no longer matches.
 var ErrOptimisticLock = errors.New("jpa: optimistic lock failed (row changed concurrently)")
+
+// SaveAllUpsert inserts rows, updating the existing row on a unique-key
+// conflict (MySQL ON DUPLICATE KEY UPDATE; Postgres/SQLite ON CONFLICT on
+// conflictProps, which must name a unique index). All non-key, non-created
+// columns are overwritten; updated/updated_by audit columns are set.
+// Generated keys are not written back.
+func (r *Repository[T, ID]) SaveAllUpsert(ctx context.Context, es []*T, conflictProps ...string) error {
+	if r.d.Name() != "mysql" && len(conflictProps) == 0 {
+		return fmt.Errorf("jpa: SaveAllUpsert needs conflict columns on %s", r.d.Name())
+	}
+	var conflict []string
+	isConflict := map[string]bool{}
+	for _, p := range conflictProps {
+		c, ok := r.meta.ResolveProperty(p)
+		if !ok {
+			return fmt.Errorf("jpa: unknown property %q on %s", p, r.meta.Table)
+		}
+		conflict = append(conflict, r.d.Quote(c.Name))
+		isConflict[c.Name] = true
+	}
+	var update []string
+	for _, c := range r.meta.Columns {
+		if c.Auto || c.PK || c.Created || c.CreatedBy || isConflict[c.Name] {
+			continue
+		}
+		update = append(update, r.d.Quote(c.Name))
+	}
+	actor := Actor(ctx)
+	cols := r.insertCols()
+	for start := 0; start < len(es); start += batchSize {
+		chunk := es[start:min(start+batchSize, len(es))]
+		q := sqlgen.Query{}
+		rows := make([]string, len(chunk))
+		for i, e := range chunk {
+			rows[i] = "(" + strings.Join(r.insertRow(&q, e, actor), ", ") + ")"
+		}
+		q.SQL = r.d.Upsert(fmt.Sprintf("INSERT INTO %s (%s) VALUES %s", r.d.Quote(r.meta.Table), strings.Join(cols, ", "), strings.Join(rows, ", ")), conflict, update)
+		if _, err := r.execute(ctx, "upsert", q); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
 // Update writes every non-key, non-created column of e by primary key. With
 // an orm:"version" column it also checks and increments the version
@@ -921,12 +1177,18 @@ func Chunk[V any](items []V, n int) [][]V {
 // while hooks (timeouts, logging) are still active. scan returns the row
 // count for hooks. Prefer Select/SelectOne/SelectScalar.
 func (r *Repository[T, ID]) QueryRows(ctx context.Context, name, query string, params map[string]any, scan func(*sql.Rows) (int64, error)) error {
-	q, err := sqlgen.Named(r.d, query, params)
-	if err != nil {
-		return err
+	var q sqlgen.Query
+	if args, ok := params["__positional__"].([]any); ok && len(params) == 1 {
+		q = sqlgen.Query{SQL: query, Args: args}
+	} else {
+		var err error
+		if q, err = sqlgen.Named(r.d, query, params); err != nil {
+			return err
+		}
 	}
-	_, err = r.run(ctx, name, q, func(ctx context.Context) (int64, error) {
-		rows, err := r.exec.QueryContext(ctx, q.SQL, q.Args...)
+	exec := r.reader(q)
+	_, err := r.run(ctx, name, q, func(ctx context.Context, q sqlgen.Query) (int64, error) {
+		rows, err := exec.QueryContext(ctx, q.SQL, q.Args...)
 		if err != nil {
 			return 0, err
 		}
@@ -1085,8 +1347,8 @@ var (
 	RawCond   = sqlgen.Raw
 )
 
-func (r *Repository[T, ID]) condQuery(verb parser.Verb, c Cond, opt sqlgen.Options) (sqlgen.Query, error) {
-	opt.Cond = c
+func (r *Repository[T, ID]) condQuery(ctx context.Context, verb parser.Verb, c Cond, opt sqlgen.Options) (sqlgen.Query, error) {
+	opt.Cond = r.withFilter(ctx, c)
 	opt.IncludeDeleted = opt.IncludeDeleted || r.includeDeleted
 	return sqlgen.Build(r.d, r.meta, &parser.Tree{Verb: verb}, nil, opt)
 }
@@ -1094,7 +1356,7 @@ func (r *Repository[T, ID]) condQuery(verb parser.Verb, c Cond, opt sqlgen.Optio
 // FindWhere returns rows matching c; a trailing Sort/Limit/Pageable applies.
 func (r *Repository[T, ID]) FindWhere(ctx context.Context, c Cond, special ...any) ([]T, error) {
 	_, opt := r.splitSpecial(special)
-	q, err := r.condQuery(parser.Find, c, opt)
+	q, err := r.condQuery(ctx, parser.Find, c, opt)
 	if err != nil {
 		return nil, err
 	}
@@ -1102,7 +1364,7 @@ func (r *Repository[T, ID]) FindWhere(ctx context.Context, c Cond, special ...an
 }
 
 func (r *Repository[T, ID]) CountWhere(ctx context.Context, c Cond) (int64, error) {
-	q, err := r.condQuery(parser.Count, c, sqlgen.Options{})
+	q, err := r.condQuery(ctx, parser.Count, c, sqlgen.Options{})
 	if err != nil {
 		return 0, err
 	}
@@ -1111,7 +1373,7 @@ func (r *Repository[T, ID]) CountWhere(ctx context.Context, c Cond) (int64, erro
 }
 
 func (r *Repository[T, ID]) ExistsWhere(ctx context.Context, c Cond) (bool, error) {
-	q, err := r.condQuery(parser.Exists, c, sqlgen.Options{})
+	q, err := r.condQuery(ctx, parser.Exists, c, sqlgen.Options{})
 	if err != nil {
 		return false, err
 	}
@@ -1120,7 +1382,7 @@ func (r *Repository[T, ID]) ExistsWhere(ctx context.Context, c Cond) (bool, erro
 }
 
 func (r *Repository[T, ID]) DeleteWhere(ctx context.Context, c Cond) (int64, error) {
-	q, err := r.condQuery(parser.Delete, c, sqlgen.Options{})
+	q, err := r.condQuery(ctx, parser.Delete, c, sqlgen.Options{})
 	if err != nil {
 		return 0, err
 	}
@@ -1192,7 +1454,7 @@ func (r *Repository[T, ID]) window(ctx context.Context, name string, t *parser.T
 	if len(sort) == 0 {
 		return Window[T]{}, fmt.Errorf("jpa: keyset scrolling needs a sort order")
 	}
-	opt := sqlgen.Options{OrderBy: sort, Limit: pos.Size + 1, IncludeDeleted: r.includeDeleted, Cond: c}
+	opt := sqlgen.Options{OrderBy: sort, Limit: pos.Size + 1, IncludeDeleted: r.includeDeleted, Cond: r.withFilter(ctx, c)}
 	if pos.Keys != nil {
 		opt.Keyset = &sqlgen.Keyset{Orders: sort, Values: pos.Keys}
 	}
@@ -1265,6 +1527,85 @@ func SelectPage[R any](ctx context.Context, r Raw, name, query, countQuery strin
 	}
 	return Page[R]{Content: content, Page: p.Page, Size: p.Size, Total: total, TotalPages: int((total + int64(p.Size) - 1) / int64(p.Size))}, nil
 }
+
+// SelectWindow keyset-scrolls a raw query by wrapping it as a subquery:
+// SELECT * FROM (<query>) q WHERE <keyset> ORDER BY ... LIMIT size+1.
+// pos.Sort is required and must end in a unique column of the result.
+func SelectWindow[R any](ctx context.Context, r Raw, name, query string, pos ScrollPosition, params map[string]any) (Window[R], error) {
+	if pos.Size <= 0 || len(pos.Sort) == 0 {
+		return Window[R]{}, fmt.Errorf("jpa: SelectWindow needs a size and a sort")
+	}
+	m, err := entity.Of[R]()
+	if err != nil {
+		return Window[R]{}, err
+	}
+	d := r.Dialect()
+	inner, err := sqlgen.Named(d, query, params) // user placeholders come first
+	if err != nil {
+		return Window[R]{}, err
+	}
+	args := append([]any{}, inner.Args...)
+	ph := func(v any) string { args = append(args, v); return d.Placeholder(len(args)) }
+	cols := make([]string, len(pos.Sort))
+	order := make([]string, len(pos.Sort))
+	for i, o := range pos.Sort {
+		c, ok := m.ResolveProperty(o.Property)
+		if !ok {
+			return Window[R]{}, fmt.Errorf("jpa: unknown sort property %q", o.Property)
+		}
+		cols[i] = d.Quote(c.Name)
+		order[i] = cols[i] + " ASC"
+		if o.Desc {
+			order[i] = cols[i] + " DESC"
+		}
+	}
+	sqlText := "SELECT * FROM (" + inner.SQL + ") q"
+	if pos.Keys != nil {
+		if len(pos.Keys) != len(pos.Sort) {
+			return Window[R]{}, fmt.Errorf("jpa: keyset has %d keys for %d sort columns", len(pos.Keys), len(pos.Sort))
+		}
+		var ors []string
+		for i := range pos.Sort {
+			var ands []string
+			for j := 0; j < i; j++ {
+				ands = append(ands, cols[j]+" = "+ph(pos.Keys[j]))
+			}
+			op := " > "
+			if pos.Sort[i].Desc {
+				op = " < "
+			}
+			ands = append(ands, cols[i]+op+ph(pos.Keys[i]))
+			ors = append(ors, "("+strings.Join(ands, " AND ")+")")
+		}
+		sqlText += " WHERE " + strings.Join(ors, " OR ")
+	}
+	sqlText += fmt.Sprintf(" ORDER BY %s LIMIT %d", strings.Join(order, ", "), pos.Size+1)
+	var out []R
+	err = r.QueryRows(ctx, name, sqlText, positionalParams(args), func(rows *sql.Rows) (int64, error) {
+		var err error
+		out, err = entity.ScanAll[R](rows)
+		return int64(len(out)), err
+	})
+	if err != nil {
+		return Window[R]{}, err
+	}
+	w := Window[R]{Content: out, Next: ScrollPosition{Size: pos.Size, Sort: pos.Sort}}
+	if len(out) > pos.Size {
+		w.Content, w.HasNext = out[:pos.Size], true
+	}
+	if n := len(w.Content); n > 0 {
+		last := reflect.ValueOf(&w.Content[n-1])
+		for _, o := range pos.Sort {
+			c, _ := m.ResolveProperty(o.Property)
+			w.Next.Keys = append(w.Next.Keys, c.Value(last).Interface())
+		}
+	}
+	return w, nil
+}
+
+// positionalParams wraps already-bound args so QueryRows (which expects
+// :name params) can run a fully rendered statement.
+func positionalParams(args []any) map[string]any { return map[string]any{"__positional__": args} }
 
 // SelectSlice runs a raw query with Pageable, fetching size+1 (no count).
 func SelectSlice[R any](ctx context.Context, r Raw, name, query string, p Pageable, params map[string]any) (Slice[R], error) {

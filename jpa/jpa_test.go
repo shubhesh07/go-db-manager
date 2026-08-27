@@ -324,3 +324,107 @@ func TestBatchUpdateAndLock(t *testing.T) {
 		t.Errorf("chunk: %v", got)
 	}
 }
+
+func TestCommentsFilterCacheReplica(t *testing.T) {
+	primary, pmock, _ := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherEqual))
+	replica, rmock, _ := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherEqual))
+	defer primary.Close()
+	defer replica.Close()
+	r := New[Warehouse, int64](primary, sqlgen.MySQL, WithComments(), WithReplica(replica), WithCache(MemoryCache(), time.Minute))
+	ctx := WithFilter(context.Background(), Eq("WarehouseId", int64(7)))
+
+	// read → replica, comment prefix, request filter ANDed in
+	q := "/* Warehouse.FindByProductCode */ SELECT " + cols + " FROM medicine_warehouse_master WHERE product_code = ? AND warehouse_id = ? AND active = 1"
+	rmock.ExpectQuery(q).WithArgs("A", int64(7)).WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(1))
+	rows, err := r.FindBy(ctx, "FindByProductCode", "A")
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("%v %v", err, rows)
+	}
+	// second call served from cache: no expectation set, must not hit any DB
+	if rows, err = r.FindBy(ctx, "FindByProductCode", "A"); err != nil || len(rows) != 1 {
+		t.Fatalf("cache: %v %v", err, rows)
+	}
+	// locked read → primary, bypasses cache
+	pmock.ExpectQuery(q+" LIMIT 1 FOR UPDATE").WithArgs("A", int64(7)).WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(1))
+	if _, err := r.FindOneBy(ctx, "FindByProductCode", "A", ForUpdate); err != nil {
+		t.Fatal(err)
+	}
+	// write → primary and clears cache
+	pmock.ExpectExec("/* Warehouse.DeleteByProductCode */ UPDATE medicine_warehouse_master SET active = 0, updated_on = NOW() WHERE product_code = ? AND warehouse_id = ? AND active = 1").
+		WithArgs("A", int64(7)).WillReturnResult(sqlmock.NewResult(0, 1))
+	if _, err := r.DeleteBy(ctx, "DeleteByProductCode", "A"); err != nil {
+		t.Fatal(err)
+	}
+	rmock.ExpectQuery(q).WithArgs("A", int64(7)).WillReturnRows(sqlmock.NewRows([]string{"id"}))
+	if rows, err = r.FindBy(ctx, "FindByProductCode", "A"); err != nil || len(rows) != 0 {
+		t.Fatalf("after invalidate: %v %v", err, rows)
+	}
+	// inside a tx: everything on the tx, replica ignored
+	pmock.ExpectBegin()
+	pmock.ExpectQuery("/* Warehouse.countAll */ SELECT COUNT(*) FROM medicine_warehouse_master WHERE warehouse_id = ? AND active = 1").
+		WithArgs(int64(7)).WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(3))
+	pmock.ExpectCommit()
+	_ = Transactional(ctx, primary, func(tx *sql.Tx) error { _, err := r.WithTx(tx).Count(ctx); return err })
+	for _, m := range []sqlmock.Sqlmock{pmock, rmock} {
+		if err := m.ExpectationsWereMet(); err != nil {
+			t.Error(err)
+		}
+	}
+}
+
+func TestSQLExplainVerifyUpsert(t *testing.T) {
+	r, mock := newRepo(t)
+	ctx := context.Background()
+	q, err := r.SQL("FindByWarehouseIdOrderByIdDesc", int64(1))
+	if err != nil || q.SQL != "SELECT "+cols+" FROM medicine_warehouse_master WHERE warehouse_id = ? AND active = 1 ORDER BY id DESC" {
+		t.Errorf("SQL(): %v %s", err, q.SQL)
+	}
+	mock.ExpectQuery("EXPLAIN SELECT " + cols + " FROM medicine_warehouse_master WHERE warehouse_id = ? AND active = 1").
+		WithArgs(int64(1)).WillReturnRows(sqlmock.NewRows([]string{"id", "select_type", "type", "key"}).AddRow(1, "SIMPLE", "ALL", nil))
+	plan, err := r.ExplainBy(ctx, "FindByWarehouseId", int64(1))
+	if err != nil || !plan.FullScan || len(plan.Rows) != 1 {
+		t.Errorf("explain: %v %+v", err, plan)
+	}
+	mock.ExpectQuery("SELECT " + cols + " FROM medicine_warehouse_master WHERE 1=0").WillReturnRows(sqlmock.NewRows([]string{"id"}))
+	if err := r.Verify(ctx); err != nil {
+		t.Errorf("verify: %v", err)
+	}
+	mock.ExpectQuery("SELECT " + cols + " FROM medicine_warehouse_master WHERE 1=0").WillReturnError(errors.New("Unknown column 'price'"))
+	if err := r.Verify(ctx); err == nil {
+		t.Error("verify must surface missing columns")
+	}
+	mock.ExpectExec("INSERT INTO medicine_warehouse_master (product_code, warehouse_id, price, active, updated_by, updated_on) VALUES (?, ?, ?, ?, ?, NOW()) ON DUPLICATE KEY UPDATE price = VALUES(price), active = VALUES(active), updated_by = VALUES(updated_by), updated_on = VALUES(updated_on)").
+		WithArgs("A", int64(1), sql.NullFloat64{}, true, int64(0)).WillReturnResult(sqlmock.NewResult(0, 1))
+	if err := r.SaveAllUpsert(ctx, []*Warehouse{{ProductCode: "A", WarehouseID: 1, Active: true}}, "ProductCode", "WarehouseId"); err != nil {
+		t.Errorf("upsert mysql: %v", err)
+	}
+	pg := New[Warehouse, int64](r.exec, sqlgen.Postgres)
+	mock.ExpectExec(`INSERT INTO medicine_warehouse_master (product_code, warehouse_id, price, active, updated_by, updated_on) VALUES ($1, $2, $3, $4, $5, NOW()) ON CONFLICT (product_code, warehouse_id) DO UPDATE SET price = EXCLUDED.price, active = EXCLUDED.active, updated_by = EXCLUDED.updated_by, updated_on = EXCLUDED.updated_on`).
+		WithArgs("A", int64(1), sql.NullFloat64{}, true, int64(0)).WillReturnResult(sqlmock.NewResult(0, 1))
+	if err := pg.SaveAllUpsert(ctx, []*Warehouse{{ProductCode: "A", WarehouseID: 1, Active: true}}, "ProductCode", "WarehouseId"); err != nil {
+		t.Errorf("upsert postgres: %v", err)
+	}
+	if err := pg.SaveAllUpsert(ctx, nil); err == nil {
+		t.Error("postgres upsert without conflict columns must fail")
+	}
+}
+
+func TestSelectWindow(t *testing.T) {
+	r, mock := newRepo(t)
+	ctx := context.Background()
+	inner := "SELECT product_code, MAX(subs_taken_count) AS subs_taken_count FROM product_sold_count WHERE product_code IN (?, ?) GROUP BY product_code"
+	mock.ExpectQuery("SELECT * FROM ("+inner+") q ORDER BY product_code ASC LIMIT 2").
+		WithArgs("A", "B").WillReturnRows(sqlmock.NewRows([]string{"product_code", "subs_taken_count"}).AddRow("A", 1).AddRow("B", 2))
+	w, err := SelectWindow[soldCount](ctx, r, "w", "SELECT product_code, MAX(subs_taken_count) AS subs_taken_count FROM product_sold_count WHERE product_code IN (:codes) GROUP BY product_code",
+		Keyset(1, Asc("ProductCode")), map[string]any{"codes": []string{"A", "B"}})
+	if err != nil || len(w.Content) != 1 || !w.HasNext || w.Next.Keys[0] != "A" {
+		t.Fatalf("%v %+v", err, w)
+	}
+	mock.ExpectQuery("SELECT * FROM ("+inner+") q WHERE (product_code > ?) ORDER BY product_code ASC LIMIT 2").
+		WithArgs("A", "B", "A").WillReturnRows(sqlmock.NewRows([]string{"product_code", "subs_taken_count"}).AddRow("B", 2))
+	w, err = SelectWindow[soldCount](ctx, r, "w", "SELECT product_code, MAX(subs_taken_count) AS subs_taken_count FROM product_sold_count WHERE product_code IN (:codes) GROUP BY product_code",
+		w.Next, map[string]any{"codes": []string{"A", "B"}})
+	if err != nil || len(w.Content) != 1 || w.HasNext {
+		t.Fatalf("%v %+v", err, w)
+	}
+}

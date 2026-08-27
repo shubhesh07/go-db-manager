@@ -24,6 +24,11 @@ type Dialect interface {
 	// MaxParams is the driver/server bind-parameter ceiling; Build returns
 	// ErrTooManyParams beyond it instead of failing inside the driver.
 	MaxParams() int
+	// Upsert turns an INSERT into an upsert. conflict/update are quoted column
+	// names; MySQL ignores conflict (it uses the table's unique keys).
+	Upsert(insert string, conflict, update []string) string
+	// ExplainPrefix is the statement prefix that returns a query plan.
+	ExplainPrefix() string
 }
 
 // ErrTooManyParams is returned when a statement would exceed Dialect.MaxParams.
@@ -37,6 +42,14 @@ func (mysql) Now() string            { return "NOW()" }
 func (mysql) Returning() bool        { return false }
 func (mysql) Quote(id string) string { return quoteWith(id, '`') }
 func (mysql) MaxParams() int         { return 65535 }
+func (mysql) ExplainPrefix() string  { return "EXPLAIN " }
+func (mysql) Upsert(insert string, _, update []string) string {
+	sets := make([]string, len(update))
+	for i, c := range update {
+		sets[i] = c + " = VALUES(" + c + ")"
+	}
+	return insert + " ON DUPLICATE KEY UPDATE " + strings.Join(sets, ", ")
+}
 
 type postgres struct{}
 
@@ -46,6 +59,10 @@ func (postgres) Now() string              { return "NOW()" }
 func (postgres) Returning() bool          { return true }
 func (postgres) Quote(id string) string   { return quoteWith(id, '"') }
 func (postgres) MaxParams() int           { return 65535 }
+func (postgres) ExplainPrefix() string    { return "EXPLAIN " }
+func (postgres) Upsert(insert string, conflict, update []string) string {
+	return onConflict(insert, conflict, update)
+}
 
 type sqlite struct{}
 
@@ -55,6 +72,18 @@ func (sqlite) Now() string            { return "CURRENT_TIMESTAMP" }
 func (sqlite) Returning() bool        { return true } // SQLite >= 3.35
 func (sqlite) Quote(id string) string { return quoteWith(id, '"') }
 func (sqlite) MaxParams() int         { return 32766 }
+func (sqlite) ExplainPrefix() string  { return "EXPLAIN QUERY PLAN " }
+func (sqlite) Upsert(insert string, conflict, update []string) string {
+	return onConflict(insert, conflict, update)
+}
+
+func onConflict(insert string, conflict, update []string) string {
+	sets := make([]string, len(update))
+	for i, c := range update {
+		sets[i] = c + " = EXCLUDED." + c
+	}
+	return insert + " ON CONFLICT (" + strings.Join(conflict, ", ") + ") DO UPDATE SET " + strings.Join(sets, ", ")
+}
 
 var (
 	MySQL    Dialect = mysql{}
@@ -134,10 +163,12 @@ type Keyset struct {
 	Values []any
 }
 
-// Query is a rendered statement.
+// Query is a rendered statement. Locked is set when a row lock was applied
+// (such reads must go to the primary, never a replica).
 type Query struct {
-	SQL  string
-	Args []any
+	SQL    string
+	Args   []any
+	Locked bool
 }
 
 type builder struct {
@@ -231,7 +262,9 @@ func Build(d Dialect, m *entity.Meta, t *parser.Tree, args []any, opt Options) (
 			b.sb.WriteString(" " + string(opt.Lock))
 		}
 	}
-	return b.finish()
+	q, err := b.finish()
+	q.Locked = opt.Lock != NoLock
+	return q, err
 }
 
 func (b *builder) where(m *entity.Meta, t *parser.Tree, args []any, opt Options) (string, error) {

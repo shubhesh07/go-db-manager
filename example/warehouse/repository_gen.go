@@ -30,6 +30,19 @@ func (r *RepositoryImpl) IncludingDeleted() *RepositoryImpl {
 	return &RepositoryImpl{Repository: r.Repository.IncludingDeleted()}
 }
 
+// MedicineWarehouseFields are property names for jpa.Cond / jpa.Sort (compile-checked).
+var MedicineWarehouseFields = struct {
+	ID           string
+	ProductCode  string
+	WarehouseID  string
+	Availability string
+	IsSearchable string
+	SuppliedByTM string
+	MRP          string
+	UpdatedBy    string
+	UpdatedOn    string
+}{ID: "ID", ProductCode: "ProductCode", WarehouseID: "WarehouseID", Availability: "Availability", IsSearchable: "IsSearchable", SuppliedByTM: "SuppliedByTM", MRP: "MRP", UpdatedBy: "UpdatedBy", UpdatedOn: "UpdatedOn"}
+
 func (r *RepositoryImpl) CountAllInWarehouse(ctx context.Context, warehouseID int64) (int64, error) {
 	return jpa.SelectScalar[int64](ctx, r, "CountAllInWarehouse", "SELECT COUNT(*) FROM medicine_warehouse_master WHERE warehouse_id = :warehouseID", map[string]any{"warehouseID": warehouseID})
 }

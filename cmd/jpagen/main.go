@@ -19,14 +19,17 @@ import (
 	"fmt"
 	"go/ast"
 	"go/format"
+	"go/token"
 	"go/types"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/shubhesh07/gojpa/entity"
 	"github.com/shubhesh07/gojpa/parser"
+	"github.com/shubhesh07/gojpa/sqlgen"
 	"golang.org/x/tools/go/packages"
 )
 
@@ -43,6 +46,8 @@ func main() {
 	mock := flag.Bool("mock", false, "also emit <type>Mock (func-field test double) in <type>_mock.go")
 	mockOnly := flag.Bool("mock-only", false, "emit only the mock (no entity needed)")
 	check := flag.Bool("check", false, "don't write; exit 1 if generated output differs from the files on disk")
+	showSQL := flag.Bool("sql", false, "print the SQL every method generates (MySQL and Postgres) and exit")
+	fields := flag.Bool("fields", true, "emit <Entity>Fields property constants for Cond/Sort")
 	flag.Parse()
 	if *typeName == "" {
 		flag.Usage()
@@ -54,7 +59,7 @@ func main() {
 	if *implName == "" {
 		*implName = *typeName + "Impl"
 	}
-	if err := run(*dir, *typeName, *ctor, *implName, *entName, *idName, *mock || *mockOnly, *mockOnly, *check); err != nil {
+	if err := run(*dir, *typeName, *ctor, *implName, *entName, *idName, *mock || *mockOnly, *mockOnly, *check, *showSQL, *fields); err != nil {
 		fmt.Fprintln(os.Stderr, "jpagen:", err)
 		os.Exit(1)
 	}
@@ -66,7 +71,7 @@ type method struct {
 	doc  []string
 }
 
-func run(dir, name, ctor, impl, entName, idName string, mock, mockOnly, check bool) error {
+func run(dir, name, ctor, impl, entName, idName string, mock, mockOnly, check, showSQL, fields bool) error {
 	outFile := filepath.Join(dir, entity.SnakeCase(name)+"_gen.go")
 	cfg := &packages.Config{Mode: packages.NeedName | packages.NeedTypes | packages.NeedSyntax | packages.NeedTypesInfo | packages.NeedFiles, Dir: dir}
 	pkgs, err := packages.Load(cfg, ".")
@@ -113,14 +118,17 @@ func run(dir, name, ctor, impl, entName, idName string, mock, mockOnly, check bo
 	if entT == nil {
 		return fmt.Errorf("%s must embed jpa.CRUD[Entity, ID] or pass -entity/-id", name)
 	}
-	resolve, err := resolver(entT)
+	meta, err := metaOf(entT)
 	if err != nil {
 		return err
 	}
+	resolve := func(p string) bool { _, ok := meta.ResolveProperty(p); return ok }
 
-	// Doc comments and user-implemented methods come from the AST.
+	// Doc comments, user-implemented methods and entity literal methods
+	// (TableName/SoftDelete returning string constants) come from the AST.
 	docs := map[string][]string{}
 	implemented := map[string]bool{}
+	literals := map[string][]string{} // "Type.Method" -> returned string literals
 	for i, f := range pkg.Syntax {
 		if filepath.Base(pkg.GoFiles[i]) == filepath.Base(outFile) {
 			continue
@@ -138,12 +146,27 @@ func run(dir, name, ctor, impl, entName, idName string, mock, mockOnly, check bo
 					}
 				}
 			case *ast.FuncDecl:
-				if d.Recv != nil && len(d.Recv.List) == 1 && recvName(d.Recv.List[0].Type) == impl {
-					implemented[d.Name.Name] = true
+				if d.Recv != nil && len(d.Recv.List) == 1 {
+					rn := recvName(d.Recv.List[0].Type)
+					if rn == impl {
+						implemented[d.Name.Name] = true
+					}
+					if lits := literalReturns(d); lits != nil {
+						literals[rn+"."+d.Name.Name] = lits
+					}
 				}
 			}
 			return true
 		})
+	}
+
+	if n, ok := types.Unalias(entT).(*types.Named); ok {
+		if l := literals[n.Obj().Name()+".TableName"]; len(l) == 1 {
+			meta.Table = l[0]
+		}
+		if l := literals[n.Obj().Name()+".SoftDelete"]; len(l) == 2 {
+			meta.SoftDeleteFilter, meta.SoftDeleteSet = l[0], l[1]
+		}
 	}
 
 	var methods []method
@@ -159,6 +182,9 @@ func run(dir, name, ctor, impl, entName, idName string, mock, mockOnly, check bo
 		methods = append(methods, method{name: m.Name(), sig: sig, doc: docs[m.Name()]})
 	}
 
+	if showSQL {
+		return printSQL(name, methods, meta)
+	}
 	g := &gen{pkg: pkg.Types, imports: map[string]string{}, entT: entT, idT: idT, ifaceName: name}
 	g.imports[jpaPath] = "jpa"
 	g.imports[sqlgenPath] = "sqlgen"
@@ -171,6 +197,17 @@ func run(dir, name, ctor, impl, entName, idName string, mock, mockOnly, check bo
 		ctor, ctor, impl, impl, g.typ(entT), g.typ(idT), pkg.Name+"."+name)
 	fmt.Fprintf(&body, "// WithTx returns a copy bound to tx.\nfunc (r *%s) WithTx(exec jpa.Executor) *%s {\n\treturn &%s{Repository: r.Repository.WithTx(exec)}\n}\n\n", impl, impl, impl)
 	fmt.Fprintf(&body, "// IncludingDeleted returns a copy that bypasses the entity's soft-delete filter.\nfunc (r *%s) IncludingDeleted() *%s {\n\treturn &%s{Repository: r.Repository.IncludingDeleted()}\n}\n\n", impl, impl, impl)
+
+	if fields {
+		var names, vals []string
+		for _, c := range meta.Columns {
+			names = append(names, c.Field+" string")
+			vals = append(vals, fmt.Sprintf("%s: %q", c.Field, c.Field))
+		}
+		entName := types.TypeString(entT, func(*types.Package) string { return "" })
+		fmt.Fprintf(&body, "// %sFields are property names for jpa.Cond / jpa.Sort (compile-checked).\nvar %sFields = struct {\n\t%s\n}{%s}\n\n",
+			entName, entName, strings.Join(names, "\n\t"), strings.Join(vals, ", "))
+	}
 
 	for _, m := range methods {
 		code, err := g.method(impl, m, resolve)
@@ -299,6 +336,31 @@ func writeMock(dir string, pkg *packages.Package, name string, iface *types.Inte
 	return emit(filepath.Join(dir, entity.SnakeCase(name)+"_mock.go"), src, check)
 }
 
+// literalReturns returns the string literals of a method whose body is a
+// single `return "a", "b"` statement, else nil.
+func literalReturns(d *ast.FuncDecl) []string {
+	if d.Body == nil || len(d.Body.List) != 1 {
+		return nil
+	}
+	ret, ok := d.Body.List[0].(*ast.ReturnStmt)
+	if !ok || len(ret.Results) == 0 {
+		return nil
+	}
+	var out []string
+	for _, r := range ret.Results {
+		lit, ok := r.(*ast.BasicLit)
+		if !ok || lit.Kind != token.STRING {
+			return nil
+		}
+		v, err := strconv.Unquote(lit.Value)
+		if err != nil {
+			return nil
+		}
+		out = append(out, v)
+	}
+	return out
+}
+
 func recvName(e ast.Expr) string {
 	if s, ok := e.(*ast.StarExpr); ok {
 		e = s.X
@@ -309,14 +371,24 @@ func recvName(e ast.Expr) string {
 	return ""
 }
 
-// resolver builds a property resolver from the entity's struct fields, using
-// the same rules as entity.Meta.ResolveProperty.
-func resolver(t types.Type) (parser.Resolver, error) {
+// metaOf builds entity metadata from go/types (same rules as entity.Of):
+// exported fields with db tags, embedded structs flattened, non-scannable
+// types (relationships) skipped.
+func metaOf(t types.Type) (*entity.Meta, error) {
 	st, ok := t.Underlying().(*types.Struct)
 	if !ok {
 		return nil, fmt.Errorf("entity %s is not a struct", t)
 	}
-	names := map[string]bool{}
+	table := entity.SnakeCase(types.TypeString(t, func(*types.Package) string { return "" }))
+	if n, ok := t.(*types.Named); ok {
+		table = entity.SnakeCase(n.Obj().Name())
+		for i := 0; i < n.NumMethods(); i++ {
+			if n.Method(i).Name() == "TableName" {
+				table = "<TableName()>"
+			}
+		}
+	}
+	var cols []entity.Column
 	var walk func(*types.Struct)
 	walk = func(st *types.Struct) {
 		for i := 0; i < st.NumFields(); i++ {
@@ -326,24 +398,61 @@ func resolver(t types.Type) (parser.Resolver, error) {
 				continue
 			}
 			if f.Embedded() {
-				if es, ok := f.Type().Underlying().(*types.Struct); ok {
+				if es, ok := f.Type().Underlying().(*types.Struct); ok && !scannable(f.Type()) {
 					walk(es)
 					continue
 				}
 			}
-			if !f.Exported() {
+			if !f.Exported() || !scannable(f.Type()) {
 				continue
 			}
-			col := tag
-			if col == "" {
-				col = entity.SnakeCase(f.Name())
+			c := entity.Column{Name: tag, Field: f.Name()}
+			if c.Name == "" {
+				c.Name = entity.SnakeCase(f.Name())
 			}
-			names[strings.ToLower(f.Name())] = true
-			names[strings.ReplaceAll(col, "_", "")] = true
+			for _, opt := range strings.Split(reflectTag(st.Tag(i), "orm"), ",") {
+				switch strings.TrimSpace(opt) {
+				case "pk":
+					c.PK = true
+				case "auto":
+					c.Auto = true
+				}
+			}
+			cols = append(cols, c)
 		}
 	}
 	walk(st)
-	return func(p string) bool { return names[strings.ToLower(strings.ReplaceAll(p, "_", ""))] }, nil
+	return entity.NewMeta(table, cols), nil
+}
+
+// scannable mirrors entity.scannable for go/types.
+func scannable(t types.Type) bool {
+	if hasScan(t) || hasScan(types.NewPointer(t)) {
+		return true
+	}
+	if p, ok := t.(*types.Pointer); ok {
+		t = p.Elem()
+	}
+	switch u := t.Underlying().(type) {
+	case *types.Basic:
+		return u.Kind() != types.UnsafePointer && u.Kind() != types.Complex64 && u.Kind() != types.Complex128
+	case *types.Slice:
+		b, ok := u.Elem().Underlying().(*types.Basic)
+		return ok && b.Kind() == types.Uint8
+	case *types.Struct:
+		return isNamed(t, "time", "Time")
+	}
+	return false
+}
+
+func hasScan(t types.Type) bool {
+	ms := types.NewMethodSet(t)
+	for i := 0; i < ms.Len(); i++ {
+		if ms.At(i).Obj().Name() == "Scan" {
+			return true
+		}
+	}
+	return false
 }
 
 func reflectTag(tag, key string) string {
@@ -572,6 +681,71 @@ func basicType(name string) types.Type {
 	if o := types.Universe.Lookup(name); o != nil {
 		if _, ok := o.Type().Underlying().(*types.Basic); ok {
 			return o.Type()
+		}
+	}
+	return nil
+}
+
+// printSQL renders each method's statement for MySQL and Postgres using
+// placeholder arguments (IN lists get two values).
+func printSQL(name string, methods []method, meta *entity.Meta) error {
+	resolve := func(p string) bool { _, ok := meta.ResolveProperty(p); return ok }
+	dialects := []sqlgen.Dialect{sqlgen.MySQL, sqlgen.Postgres}
+	for _, m := range methods {
+		var query string
+		for _, d := range m.doc {
+			if strings.HasPrefix(d, "jpa:query") {
+				query = strings.TrimSpace(strings.TrimPrefix(d, "jpa:query"))
+			} else if query != "" && !strings.HasPrefix(d, "jpa:") {
+				query += " " + d
+			}
+		}
+		fmt.Printf("%s.%s\n", name, m.name)
+		if query != "" {
+			params := map[string]any{}
+			for i := 1; i < m.sig.Params().Len(); i++ {
+				p := m.sig.Params().At(i)
+				if _, ok := p.Type().(*types.Slice); ok {
+					params[p.Name()] = []any{"?", "?"}
+				} else {
+					params[p.Name()] = "?"
+				}
+			}
+			for _, d := range dialects {
+				q, err := sqlgen.Named(d, query, params)
+				if err != nil {
+					fmt.Printf("  %-9s error: %v\n", d.Name()+":", err)
+					continue
+				}
+				fmt.Printf("  %-9s %s\n", d.Name()+":", q.SQL)
+			}
+			continue
+		}
+		tree, err := parser.Parse(m.name, resolve)
+		if err != nil {
+			fmt.Printf("  error: %v\n", err)
+			continue
+		}
+		var args []any
+		for _, ands := range tree.Or {
+			for _, p := range ands {
+				switch p.Op {
+				case "In", "NotIn":
+					args = append(args, []any{"?", "?"})
+				default:
+					for i := 0; i < p.NumArgs; i++ {
+						args = append(args, "?")
+					}
+				}
+			}
+		}
+		for _, d := range dialects {
+			q, err := sqlgen.Build(d, meta, tree, args, sqlgen.Options{})
+			if err != nil {
+				fmt.Printf("  %-9s error: %v\n", d.Name()+":", err)
+				continue
+			}
+			fmt.Printf("  %-9s %s\n", d.Name()+":", q.SQL)
 		}
 	}
 	return nil

@@ -303,4 +303,60 @@ func run(t *testing.T, db *sql.DB, d sqlgen.Dialect) {
 	if slow == 0 {
 		t.Error("SlowQuery hook never fired")
 	}
+
+	// v0.3.0: Verify, ExplainBy, upsert, request filter, cache, SelectWindow.
+	if err := repo.Verify(ctx); err != nil {
+		t.Errorf("Verify: %v", err)
+	}
+	plan, err := repo.ExplainBy(ctx, "FindByWarehouseId", int64(1))
+	if err != nil || len(plan.Rows) == 0 {
+		t.Errorf("ExplainBy: %v %+v", err, plan)
+	}
+	if !plan.FullScan { // no index on warehouse_id in the test schema
+		t.Logf("%s: expected FullScan on unindexed warehouse_id, plan=%+v", d.Name(), plan.Rows)
+	}
+	if _, err := db.Exec("CREATE UNIQUE INDEX ux_code_wh ON medicine_warehouse_master (product_code, warehouse_id)"); err != nil {
+		t.Fatalf("index: %v", err)
+	}
+	up := &warehouse.MedicineWarehouse{ProductCode: "A", WarehouseID: 1, Availability: true, IsSearchable: true, MRP: sql.NullFloat64{Float64: 99, Valid: true}}
+	if err := repo.SaveAllUpsert(ctx, []*warehouse.MedicineWarehouse{up, {ProductCode: "NEW", WarehouseID: 9, IsSearchable: true}}, "ProductCode", "WarehouseId"); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	a, err := repo.FindByProductCodeAndWarehouseId(ctx, "A", 1)
+	if err != nil || a.MRP.Float64 != 99 {
+		t.Errorf("upsert updated row: %v %+v", err, a)
+	}
+	if n, _ := repo.IncludingDeleted().Count(ctx); n != 4 {
+		t.Errorf("upsert inserted row: count=%d", n)
+	}
+	fctx := jpa.WithFilter(ctx, jpa.Eq(warehouse.MedicineWarehouseFields.WarehouseID, int64(9)))
+	if all, err := repo.IncludingDeleted().FindAll(fctx); err != nil || len(all) != 1 || all[0].ProductCode != "NEW" {
+		t.Errorf("WithFilter: %v %+v", err, all)
+	}
+	cached := warehouse.NewRepository(db, d, jpa.WithCache(jpa.MemoryCache(), time.Minute))
+	first, _ := cached.FindByProductCodeInAndWarehouseId(ctx, []string{"NEW"}, 9)
+	if _, err := db.Exec("UPDATE medicine_warehouse_master SET mrp = 5 WHERE product_code = 'NEW'"); err != nil {
+		t.Fatal(err)
+	}
+	again, _ := cached.FindByProductCodeInAndWarehouseId(ctx, []string{"NEW"}, 9)
+	if len(first) != 1 || len(again) != 1 || again[0].MRP.Valid {
+		t.Errorf("cache should have served the stale row: %+v", again)
+	}
+	cached.InvalidateCache()
+	fresh, _ := cached.FindByProductCodeInAndWarehouseId(ctx, []string{"NEW"}, 9)
+	if len(fresh) != 1 || fresh[0].MRP.Float64 != 5 {
+		t.Errorf("after InvalidateCache: %+v", fresh)
+	}
+	sw, err := jpa.SelectWindow[warehouse.SoldCount](ctx, repo, "sold-window",
+		"SELECT product_code, MAX(subs_taken_count) AS subs_taken_count FROM product_sold_count WHERE product_code IN (:codes) GROUP BY product_code",
+		jpa.Keyset(1, jpa.Asc("ProductCode")), map[string]any{"codes": []string{"A", "B"}})
+	if err != nil || len(sw.Content) != 1 || !sw.HasNext || sw.Content[0].ProductCode != "A" {
+		t.Fatalf("SelectWindow 1: %v %+v", err, sw)
+	}
+	sw, err = jpa.SelectWindow[warehouse.SoldCount](ctx, repo, "sold-window",
+		"SELECT product_code, MAX(subs_taken_count) AS subs_taken_count FROM product_sold_count WHERE product_code IN (:codes) GROUP BY product_code",
+		sw.Next, map[string]any{"codes": []string{"A", "B"}})
+	if err != nil || len(sw.Content) != 1 || sw.HasNext || sw.Content[0].ProductCode != "B" {
+		t.Errorf("SelectWindow 2: %v %+v", err, sw)
+	}
 }
