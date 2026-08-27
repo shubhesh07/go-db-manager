@@ -6,7 +6,7 @@ import (
 	"github.com/shubhesh07/gojpa/jpa"
 )
 
-//go:generate go run github.com/shubhesh07/gojpa/cmd/jpagen -type Repository
+//go:generate go run github.com/shubhesh07/gojpa/cmd/jpagen -type Repository -mock
 
 // Repository is written exactly like a Spring Data interface; jpagen emits
 // repository_gen.go. UpdateBatch is hand-written in impl.go.
@@ -17,6 +17,7 @@ type Repository interface {
 	FindByProductCodeInAndWarehouseId(ctx context.Context, codes []string, warehouseID int64) ([]MedicineWarehouse, error)
 	FindByProductCodeInAndWarehouseIdIn(ctx context.Context, codes []string, warehouseIDs []int64) ([]MedicineWarehouse, error)
 	FindByProductCodeAndWarehouseId(ctx context.Context, code string, warehouseID int64) (*MedicineWarehouse, error)
+	FindLockedByProductCodeAndWarehouseId(ctx context.Context, code string, warehouseID int64, lock jpa.LockMode) (*MedicineWarehouse, error)
 	FindByWarehouseIdOrderByProductCodeAsc(ctx context.Context, warehouseID int64, p jpa.Pageable) (jpa.Page[MedicineWarehouse], error)
 	CountByWarehouseIdAndAvailabilityTrue(ctx context.Context, warehouseID int64) (int64, error)
 	ExistsByProductCodeAndWarehouseId(ctx context.Context, code string, warehouseID int64) (bool, error)

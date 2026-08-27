@@ -40,6 +40,14 @@ func Desc(prop string) Order { return Order{Property: prop, Desc: true} }
 // Limit is a dynamic LIMIT.
 type Limit int
 
+// LockMode is a trailing special parameter adding FOR UPDATE / FOR SHARE.
+type LockMode = sqlgen.Lock
+
+const (
+	ForUpdate = sqlgen.ForUpdate
+	ForShare  = sqlgen.ForShare
+)
+
 // Pageable is a zero-based page request.
 type Pageable struct {
 	Page, Size int
@@ -114,10 +122,89 @@ type Option func(*config)
 type config struct {
 	hooks []Hook
 	name  string
+	retry *RetryPolicy
 }
 
 func WithHook(h Hook) Option   { return func(c *config) { c.hooks = append(c.hooks, h) } }
 func WithName(n string) Option { return func(c *config) { c.name = n } }
+
+// WithDefaultTimeout applies a per-statement deadline to every query
+// (same as WithHook(Timeout(d)), named for discoverability).
+func WithDefaultTimeout(d time.Duration) Option { return WithHook(Timeout(d)) }
+
+// ---- retry ----------------------------------------------------------------
+
+// RetryPolicy re-runs a statement when Retryable(err) is true. Reads are
+// always eligible; writes only when Writes is true (they must be idempotent —
+// the CASE-WHEN batch updates are, plain INSERTs are not).
+type RetryPolicy struct {
+	Attempts  int           // total attempts, >= 1
+	Backoff   time.Duration // base; doubles per attempt
+	Retryable func(error) bool
+	Writes    bool
+}
+
+func WithRetry(p RetryPolicy) Option { return func(c *config) { c.retry = &p } }
+
+// IsDeadlock reports MySQL 1213/1205 and Postgres 40001/40P01 (serialization
+// failure / deadlock) without importing a driver.
+func IsDeadlock(err error) bool {
+	if err == nil {
+		return false
+	}
+	var st interface{ SQLState() string }
+	if errors.As(err, &st) {
+		switch st.SQLState() {
+		case "40001", "40P01":
+			return true
+		}
+	}
+	var num interface{ Number() uint16 }
+	if errors.As(err, &num) {
+		switch num.Number() {
+		case 1213, 1205:
+			return true
+		}
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "error 1213") || strings.Contains(msg, "error 1205") ||
+		strings.Contains(msg, "deadlock") || strings.Contains(msg, "lock wait timeout")
+}
+
+// IsTransient is IsDeadlock plus connection resets ("bad connection",
+// "connection reset", "broken pipe").
+func IsTransient(err error) bool {
+	if IsDeadlock(err) {
+		return true
+	}
+	if errors.Is(err, sql.ErrConnDone) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "bad connection") || strings.Contains(msg, "connection reset") || strings.Contains(msg, "broken pipe")
+}
+
+// ---- ready-made hooks ------------------------------------------------------
+
+// Metrics calls observe after every statement; plug Prometheus/OTel in there.
+func Metrics(observe func(name string, d time.Duration, rows int64, err error)) Hook {
+	return HookFunc(func(ctx context.Context, q Query) (context.Context, func(int64, error)) {
+		start := time.Now()
+		return ctx, func(rows int64, err error) { observe(q.Name, time.Since(start), rows, err) }
+	})
+}
+
+// SlowQuery calls report for statements slower than threshold.
+func SlowQuery(threshold time.Duration, report func(q Query, d time.Duration)) Hook {
+	return HookFunc(func(ctx context.Context, q Query) (context.Context, func(int64, error)) {
+		start := time.Now()
+		return ctx, func(int64, error) {
+			if d := time.Since(start); d >= threshold {
+				report(q, d)
+			}
+		}
+	})
+}
 
 // Repository is the CRUD + derived-query engine for entity T with key ID.
 // It is safe for concurrent use.
@@ -165,6 +252,34 @@ func (r *Repository[T, ID]) Dialect() sqlgen.Dialect { return r.d }
 func (r *Repository[T, ID]) Executor() Executor      { return r.exec }
 
 func (r *Repository[T, ID]) run(ctx context.Context, name string, q sqlgen.Query, fn func(ctx context.Context) (int64, error)) (int64, error) {
+	attempts := 1
+	if p := r.cfg.retry; p != nil && p.Attempts > 1 && (p.Writes || isRead(q.SQL)) {
+		attempts = p.Attempts
+	}
+	var n int64
+	var err error
+	for i := 0; i < attempts; i++ {
+		if i > 0 {
+			d := r.cfg.retry.Backoff << (i - 1)
+			select {
+			case <-time.After(d):
+			case <-ctx.Done():
+				return n, ctx.Err()
+			}
+		}
+		n, err = r.once(ctx, name, q, fn)
+		if err == nil || i == attempts-1 || !r.cfg.retry.Retryable(err) || ctx.Err() != nil {
+			return n, err
+		}
+	}
+	return n, err
+}
+
+func isRead(sql string) bool {
+	return strings.HasPrefix(strings.ToUpper(strings.TrimSpace(sql)), "SELECT")
+}
+
+func (r *Repository[T, ID]) once(ctx context.Context, name string, q sqlgen.Query, fn func(ctx context.Context) (int64, error)) (int64, error) {
 	query := Query{Name: r.cfg.name + "." + name, SQL: q.SQL, Args: q.Args}
 	var dones []func(int64, error)
 	for _, h := range r.cfg.hooks {
@@ -244,6 +359,8 @@ func (r *Repository[T, ID]) splitSpecial(args []any) ([]any, sqlgen.Options) {
 			opt.OrderBy = v
 		case Limit:
 			opt.Limit = int(v)
+		case LockMode:
+			opt.Lock = v
 		default:
 			return args, opt
 		}
@@ -271,9 +388,41 @@ func (r *Repository[T, ID]) FindBy(ctx context.Context, method string, args ...a
 	return r.query(ctx, method, q)
 }
 
+// EachBy streams a derived find row by row without loading the result set;
+// fn returning an error stops the iteration. (Spring's Stream<T>.)
+func (r *Repository[T, ID]) EachBy(ctx context.Context, method string, fn func(T) error, args ...any) error {
+	_, q, _, err := r.build(method, args)
+	if err != nil {
+		return err
+	}
+	_, err = r.run(ctx, method, q, func(ctx context.Context) (int64, error) {
+		rows, err := r.exec.QueryContext(ctx, q.SQL, q.Args...)
+		if err != nil {
+			return 0, err
+		}
+		defer rows.Close()
+		cols, err := rows.Columns()
+		if err != nil {
+			return 0, err
+		}
+		var n int64
+		for rows.Next() {
+			var item T
+			if err := rows.Scan(r.meta.ScanTargets(cols, reflect.ValueOf(&item))...); err != nil {
+				return n, err
+			}
+			n++
+			if err := fn(item); err != nil {
+				return n, err
+			}
+		}
+		return n, rows.Err()
+	})
+	return err
+}
+
 // FindOneBy returns the first row or ErrNotFound.
 func (r *Repository[T, ID]) FindOneBy(ctx context.Context, method string, args ...any) (*T, error) {
-	args, _ = r.splitSpecial(args)
 	rows, err := r.FindBy(ctx, method, append(args, Limit(1))...)
 	if err != nil {
 		return nil, err
@@ -464,7 +613,7 @@ func (r *Repository[T, ID]) insertCols() []string {
 	var cols []string
 	for _, c := range r.meta.Columns {
 		if !c.Auto {
-			cols = append(cols, c.Name)
+			cols = append(cols, r.d.Quote(c.Name))
 		}
 	}
 	return cols
@@ -510,9 +659,9 @@ func (r *Repository[T, ID]) saveAll(ctx context.Context, es []*T) error {
 		for i, e := range chunk {
 			rows[i] = "(" + strings.Join(r.insertRow(&q, e, actor), ", ") + ")"
 		}
-		q.SQL = fmt.Sprintf("INSERT INTO %s (%s) VALUES %s", r.meta.Table, strings.Join(cols, ", "), strings.Join(rows, ", "))
+		q.SQL = fmt.Sprintf("INSERT INTO %s (%s) VALUES %s", r.d.Quote(r.meta.Table), strings.Join(cols, ", "), strings.Join(rows, ", "))
 		if pk != nil && pk.Auto && r.d.Returning() {
-			q.SQL += " RETURNING " + pk.Name
+			q.SQL += " RETURNING " + r.d.Quote(pk.Name)
 			_, err := r.run(ctx, "save", q, func(ctx context.Context) (int64, error) {
 				rs, err := r.exec.QueryContext(ctx, q.SQL, q.Args...)
 				if err != nil {
@@ -555,7 +704,13 @@ func (r *Repository[T, ID]) saveAll(ctx context.Context, es []*T) error {
 	return nil
 }
 
-// Update writes every non-key, non-created column of e by primary key.
+// ErrOptimisticLock is returned by Update when the entity has an
+// orm:"version" column and the row's version no longer matches.
+var ErrOptimisticLock = errors.New("jpa: optimistic lock failed (row changed concurrently)")
+
+// Update writes every non-key, non-created column of e by primary key. With
+// an orm:"version" column it also checks and increments the version
+// (optimistic locking) and bumps e's version on success.
 func (r *Repository[T, ID]) Update(ctx context.Context, e *T) error {
 	pk := r.meta.PK
 	if pk == nil {
@@ -567,23 +722,197 @@ func (r *Repository[T, ID]) Update(ctx context.Context, e *T) error {
 	var sets []string
 	for i := range r.meta.Columns {
 		c := &r.meta.Columns[i]
+		name := r.d.Quote(c.Name)
 		switch {
 		case c.PK || c.Created || c.CreatedBy:
 			continue
+		case c.Version:
+			sets = append(sets, name+" = "+name+" + 1")
 		case c.Updated:
-			sets = append(sets, c.Name+" = "+r.d.Now())
+			sets = append(sets, name+" = "+r.d.Now())
 		case c.UpdatedBy && actor != nil:
 			q.Args = append(q.Args, actor)
-			sets = append(sets, c.Name+" = "+r.d.Placeholder(len(q.Args)))
+			sets = append(sets, name+" = "+r.d.Placeholder(len(q.Args)))
 		default:
 			q.Args = append(q.Args, c.Value(v).Interface())
-			sets = append(sets, c.Name+" = "+r.d.Placeholder(len(q.Args)))
+			sets = append(sets, name+" = "+r.d.Placeholder(len(q.Args)))
 		}
 	}
 	q.Args = append(q.Args, pk.Value(v).Interface())
-	q.SQL = fmt.Sprintf("UPDATE %s SET %s WHERE %s = %s", r.meta.Table, strings.Join(sets, ", "), pk.Name, r.d.Placeholder(len(q.Args)))
-	_, err := r.execute(ctx, "update", q)
-	return err
+	q.SQL = fmt.Sprintf("UPDATE %s SET %s WHERE %s = %s", r.d.Quote(r.meta.Table), strings.Join(sets, ", "), r.d.Quote(pk.Name), r.d.Placeholder(len(q.Args)))
+	if ver := r.meta.Version; ver != nil {
+		q.Args = append(q.Args, ver.Value(v).Interface())
+		q.SQL += " AND " + r.d.Quote(ver.Name) + " = " + r.d.Placeholder(len(q.Args))
+	}
+	n, err := r.execute(ctx, "update", q)
+	if err != nil {
+		return err
+	}
+	if ver := r.meta.Version; ver != nil {
+		if n == 0 {
+			return ErrOptimisticLock
+		}
+		f := ver.Value(v)
+		if f.CanInt() {
+			f.SetInt(f.Int() + 1)
+		} else if f.CanUint() {
+			f.SetUint(f.Uint() + 1)
+		}
+	}
+	return nil
+}
+
+// ---- batch update (CASE WHEN) -------------------------------------------
+
+// BatchRow is one row of a BatchUpdate: Key identifies the row (one or more
+// columns, e.g. product_code or product_code+warehouse_id); Set holds the
+// columns to change. Columns absent from a row's Set are left unchanged.
+type BatchRow struct {
+	Key map[string]any
+	Set map[string]any
+}
+
+// BatchUpdate updates many rows with per-row values in one statement per
+// chunk of 500, rendering
+//
+//	col = CASE WHEN k1 = ? AND k2 = ? THEN ? ... ELSE col END
+//
+// for every column set by at least one row, plus updated/updated_by audit
+// columns, WHERE (k1 = ? AND k2 = ?) OR .... Property names resolve like
+// method names (ProductCode, product_code and WarehouseId all work).
+// Returns rows affected.
+func (r *Repository[T, ID]) BatchUpdate(ctx context.Context, rows []BatchRow) (int64, error) {
+	var total int64
+	for start := 0; start < len(rows); start += batchSize {
+		n, err := r.batchChunk(ctx, rows[start:min(start+batchSize, len(rows))])
+		if err != nil {
+			return total, err
+		}
+		total += n
+	}
+	return total, nil
+}
+
+func (r *Repository[T, ID]) batchChunk(ctx context.Context, rows []BatchRow) (int64, error) {
+	if len(rows) == 0 {
+		return 0, nil
+	}
+	resolve := func(p string) (string, error) {
+		c, ok := r.meta.ResolveProperty(p)
+		if !ok {
+			return "", fmt.Errorf("jpa: unknown property %q on %s", p, r.meta.Table)
+		}
+		return r.d.Quote(c.Name), nil
+	}
+	// stable key column order from the first row
+	var keyProps []string
+	for k := range rows[0].Key {
+		keyProps = append(keyProps, k)
+	}
+	sortStrings(keyProps)
+	keyCols := make([]string, len(keyProps))
+	for i, k := range keyProps {
+		c, err := resolve(k)
+		if err != nil {
+			return 0, err
+		}
+		keyCols[i] = c
+	}
+	// union of set columns, stable order
+	seen := map[string]bool{}
+	var setProps []string
+	for _, row := range rows {
+		for k := range row.Set {
+			if !seen[k] {
+				seen[k] = true
+				setProps = append(setProps, k)
+			}
+		}
+	}
+	sortStrings(setProps)
+
+	q := sqlgen.Query{}
+	bind := func(v any) string {
+		q.Args = append(q.Args, v)
+		return r.d.Placeholder(len(q.Args))
+	}
+	keyMatch := func(row BatchRow) (string, error) {
+		parts := make([]string, len(keyProps))
+		for i, k := range keyProps {
+			v, ok := row.Key[k]
+			if !ok {
+				return "", fmt.Errorf("jpa: batch row missing key %q", k)
+			}
+			parts[i] = keyCols[i] + " = " + bind(v)
+		}
+		return strings.Join(parts, " AND "), nil
+	}
+	var sets []string
+	for _, p := range setProps {
+		col, err := resolve(p)
+		if err != nil {
+			return 0, err
+		}
+		var whens []string
+		for _, row := range rows {
+			v, ok := row.Set[p]
+			if !ok {
+				continue
+			}
+			km, err := keyMatch(row)
+			if err != nil {
+				return 0, err
+			}
+			whens = append(whens, "WHEN "+km+" THEN "+bind(v))
+		}
+		sets = append(sets, fmt.Sprintf("%s = CASE %s ELSE %s END", col, strings.Join(whens, " "), col))
+	}
+	if len(sets) == 0 {
+		return 0, nil
+	}
+	actor := Actor(ctx)
+	for _, c := range r.meta.Columns {
+		switch {
+		case c.Updated:
+			sets = append(sets, r.d.Quote(c.Name)+" = "+r.d.Now())
+		case c.UpdatedBy && actor != nil:
+			sets = append(sets, r.d.Quote(c.Name)+" = "+bind(actor))
+		}
+	}
+	where := make([]string, len(rows))
+	for i, row := range rows {
+		km, err := keyMatch(row)
+		if err != nil {
+			return 0, err
+		}
+		where[i] = "(" + km + ")"
+	}
+	q.SQL = fmt.Sprintf("UPDATE %s SET %s WHERE %s", r.d.Quote(r.meta.Table), strings.Join(sets, ", "), strings.Join(where, " OR "))
+	if len(q.Args) > r.d.MaxParams() {
+		return 0, fmt.Errorf("%w: %d", sqlgen.ErrTooManyParams, len(q.Args))
+	}
+	return r.execute(ctx, "batchUpdate", q)
+}
+
+func sortStrings(s []string) {
+	for i := 1; i < len(s); i++ {
+		for j := i; j > 0 && s[j] < s[j-1]; j-- {
+			s[j], s[j-1] = s[j-1], s[j]
+		}
+	}
+}
+
+// Chunk splits items into slices of at most n for statements with large IN
+// lists (see sqlgen.ErrTooManyParams).
+func Chunk[V any](items []V, n int) [][]V {
+	if n <= 0 || len(items) == 0 {
+		return nil
+	}
+	var out [][]V
+	for start := 0; start < len(items); start += n {
+		out = append(out, items[start:min(start+n, len(items))])
+	}
+	return out
 }
 
 // ---- raw queries (the @Query / @Modifying escape hatch) -----------------

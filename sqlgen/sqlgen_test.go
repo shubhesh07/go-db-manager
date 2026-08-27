@@ -1,7 +1,9 @@
 package sqlgen
 
 import (
+	"errors"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -110,5 +112,62 @@ func TestPositional(t *testing.T) {
 	}
 	if _, err := Positional(MySQL, "? ?", []any{1}); err == nil {
 		t.Error("expected arg-count error")
+	}
+}
+
+type Reserved struct {
+	ID    int64  `db:"id" orm:"pk,auto"`
+	Order int    `db:"order"`
+	Group string `db:"group"`
+	Odd   string `db:"odd-name"`
+}
+
+func (*Reserved) TableName() string { return "user" }
+
+func TestQuotingAndLocks(t *testing.T) {
+	m, _ := entity.Of[Reserved]()
+	res := func(p string) bool { _, ok := m.ResolveProperty(p); return ok }
+	tree, err := parser.Parse("FindByOrderOrderByGroupDesc", res)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q, err := Build(MySQL, m, tree, []any{1}, Options{Lock: ForUpdate})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "SELECT id, `order`, `group`, `odd-name` FROM `user` WHERE `order` = ? ORDER BY `group` DESC FOR UPDATE"
+	if q.SQL != want {
+		t.Errorf("\n got %s\nwant %s", q.SQL, want)
+	}
+	q, _ = Build(Postgres, m, tree, []any{1}, Options{Lock: ForShare})
+	want = `SELECT id, "order", "group", "odd-name" FROM "user" WHERE "order" = $1 ORDER BY "group" DESC FOR SHARE`
+	if q.SQL != want {
+		t.Errorf("\n got %s\nwant %s", q.SQL, want)
+	}
+	q, _ = Build(SQLite, m, tree, []any{1}, Options{Lock: ForUpdate})
+	if strings.Contains(q.SQL, "FOR UPDATE") {
+		t.Errorf("sqlite must drop locks: %s", q.SQL)
+	}
+	q, _ = Build(MySQL, m, &parser.Tree{Verb: parser.Count}, nil, Options{Cond: Eq("Group", "x")})
+	if q.SQL != "SELECT COUNT(*) FROM `user` WHERE `group` = ?" {
+		t.Errorf("cond quoting: %s", q.SQL)
+	}
+}
+
+func TestLikeEscapeAndParamLimit(t *testing.T) {
+	m, _ := entity.Of[Order]()
+	res := func(p string) bool { _, ok := m.ResolveProperty(p); return ok }
+	tree, _ := parser.Parse("FindByNameContaining", res)
+	q, _ := Build(MySQL, m, tree, []any{"50%_off\\"}, Options{})
+	if q.Args[0] != `%50\%\_off\\%` {
+		t.Errorf("escape: %q", q.Args[0])
+	}
+	tree, _ = parser.Parse("FindByOrderIdIn", res)
+	big := make([]int, 70000)
+	if _, err := Build(MySQL, m, tree, []any{big}, Options{}); !errors.Is(err, ErrTooManyParams) {
+		t.Errorf("want ErrTooManyParams, got %v", err)
+	}
+	if _, err := Build(Postgres, m, tree, []any{big[:65535]}, Options{}); err != nil {
+		t.Errorf("65535 params must be allowed: %v", err)
 	}
 }

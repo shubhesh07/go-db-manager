@@ -74,7 +74,7 @@ func (r *RepositoryImpl) updateChunk(ctx context.Context, userID int64, chunk []
 	if len(sets) == 0 {
 		return 0, nil
 	}
-	sets = append(sets, "updated_by = :userID", "updated_on = NOW()")
+	sets = append(sets, "updated_by = :userID", "updated_on = "+r.Dialect().Now())
 	for _, u := range chunk {
 		where = append(where, fmt.Sprintf("(product_code = %s AND warehouse_id = %s)", bind(u.ProductCode), bind(u.WarehouseID)))
 	}

@@ -25,6 +25,11 @@ func (r *RepositoryImpl) WithTx(exec jpa.Executor) *RepositoryImpl {
 	return &RepositoryImpl{Repository: r.Repository.WithTx(exec)}
 }
 
+// IncludingDeleted returns a copy that bypasses the entity's soft-delete filter.
+func (r *RepositoryImpl) IncludingDeleted() *RepositoryImpl {
+	return &RepositoryImpl{Repository: r.Repository.IncludingDeleted()}
+}
+
 func (r *RepositoryImpl) CountAllInWarehouse(ctx context.Context, warehouseID int64) (int64, error) {
 	return jpa.SelectScalar[int64](ctx, r, "CountAllInWarehouse", "SELECT COUNT(*) FROM medicine_warehouse_master WHERE warehouse_id = :warehouseID", map[string]any{"warehouseID": warehouseID})
 }
@@ -59,6 +64,10 @@ func (r *RepositoryImpl) FindByWarehouseIdOrderByProductCodeAsc(ctx context.Cont
 
 func (r *RepositoryImpl) FindByWarehouseIdOrderByProductCodeAscIdAsc(ctx context.Context, warehouseID int64, pos jpa.ScrollPosition) (jpa.Window[MedicineWarehouse], error) {
 	return r.WindowBy(ctx, "FindByWarehouseIdOrderByProductCodeAscIdAsc", pos, warehouseID)
+}
+
+func (r *RepositoryImpl) FindLockedByProductCodeAndWarehouseId(ctx context.Context, code string, warehouseID int64, lock jpa.LockMode) (*MedicineWarehouse, error) {
+	return r.FindOneBy(ctx, "FindLockedByProductCodeAndWarehouseId", code, warehouseID, lock)
 }
 
 func (r *RepositoryImpl) GetSoldCounts(ctx context.Context, codes []string) ([]SoldCount, error) {

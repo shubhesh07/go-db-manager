@@ -3,6 +3,7 @@
 package sqlgen
 
 import (
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
@@ -16,7 +17,17 @@ type Dialect interface {
 	Placeholder(n int) string // 1-based
 	Now() string
 	Returning() bool // INSERT ... RETURNING pk supported
+	// Quote wraps an identifier that needs quoting (reserved word or unusual
+	// characters). Plain snake_case identifiers are emitted bare so generated
+	// SQL stays readable and stable.
+	Quote(ident string) string
+	// MaxParams is the driver/server bind-parameter ceiling; Build returns
+	// ErrTooManyParams beyond it instead of failing inside the driver.
+	MaxParams() int
 }
+
+// ErrTooManyParams is returned when a statement would exceed Dialect.MaxParams.
+var ErrTooManyParams = errors.New("sqlgen: too many bind parameters")
 
 type mysql struct{}
 
@@ -24,6 +35,8 @@ func (mysql) Name() string           { return "mysql" }
 func (mysql) Placeholder(int) string { return "?" }
 func (mysql) Now() string            { return "NOW()" }
 func (mysql) Returning() bool        { return false }
+func (mysql) Quote(id string) string { return quoteWith(id, '`') }
+func (mysql) MaxParams() int         { return 65535 }
 
 type postgres struct{}
 
@@ -31,11 +44,68 @@ func (postgres) Name() string             { return "postgres" }
 func (postgres) Placeholder(n int) string { return fmt.Sprintf("$%d", n) }
 func (postgres) Now() string              { return "NOW()" }
 func (postgres) Returning() bool          { return true }
+func (postgres) Quote(id string) string   { return quoteWith(id, '"') }
+func (postgres) MaxParams() int           { return 65535 }
+
+type sqlite struct{}
+
+func (sqlite) Name() string           { return "sqlite" }
+func (sqlite) Placeholder(int) string { return "?" }
+func (sqlite) Now() string            { return "CURRENT_TIMESTAMP" }
+func (sqlite) Returning() bool        { return true } // SQLite >= 3.35
+func (sqlite) Quote(id string) string { return quoteWith(id, '"') }
+func (sqlite) MaxParams() int         { return 32766 }
 
 var (
 	MySQL    Dialect = mysql{}
 	Postgres Dialect = postgres{}
+	SQLite   Dialect = sqlite{}
 )
+
+// reserved lists identifiers that must be quoted on at least one supported
+// dialect. Deliberately small: common column names that are keywords.
+var reserved = map[string]bool{
+	"add": true, "all": true, "alter": true, "and": true, "as": true, "asc": true, "between": true, "by": true,
+	"case": true, "check": true, "column": true, "constraint": true, "create": true, "cross": true,
+	"current_date": true, "current_time": true, "current_timestamp": true, "default": true, "delete": true,
+	"desc": true, "distinct": true, "drop": true, "else": true, "end": true, "exists": true, "for": true,
+	"foreign": true, "from": true, "group": true, "grouping": true, "having": true, "in": true, "index": true,
+	"inner": true, "insert": true, "into": true, "is": true, "join": true, "key": true, "keys": true,
+	"lateral": true, "left": true, "like": true, "limit": true, "lock": true, "natural": true, "not": true,
+	"null": true, "of": true, "offset": true, "on": true, "or": true, "order": true, "outer": true,
+	"primary": true, "rank": true, "references": true, "right": true, "row": true, "rows": true,
+	"select": true, "set": true, "system": true, "table": true, "then": true, "to": true, "union": true,
+	"unique": true, "update": true, "user": true, "using": true, "values": true, "when": true, "where": true,
+	"window": true, "with": true,
+}
+
+func needsQuote(id string) bool {
+	if id == "" || reserved[strings.ToLower(id)] {
+		return true
+	}
+	for i := 0; i < len(id); i++ {
+		c := id[i]
+		ok := c == '_' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || (c >= '0' && c <= '9' && i > 0)
+		if !ok {
+			return true
+		}
+	}
+	return false
+}
+
+func quoteWith(id string, q byte) string {
+	if !needsQuote(id) {
+		return id
+	}
+	return string(q) + strings.ReplaceAll(id, string(q), string(q)+string(q)) + string(q)
+}
+
+// EscapeLike escapes %, _ and \ in a LIKE operand so user text matches
+// literally. MySQL, Postgres and SQLite default the escape character to \.
+func EscapeLike(s string) string {
+	r := strings.NewReplacer(`\`, `\\`, "%", `\%`, "_", `\_`)
+	return r.Replace(s)
+}
 
 // Options are the call-time special parameters (Pageable, Sort, Limit).
 type Options struct {
@@ -44,7 +114,17 @@ type Options struct {
 	IncludeDeleted bool
 	Cond           Cond    // extra condition ANDed with the tree (Specification)
 	Keyset         *Keyset // keyset-scroll boundary, requires OrderBy
+	Lock           Lock    // row lock appended to SELECTs
 }
+
+// Lock is a row-level lock clause for SELECT (Spring @Lock).
+type Lock string
+
+const (
+	NoLock    Lock = ""
+	ForUpdate Lock = "FOR UPDATE"
+	ForShare  Lock = "FOR SHARE" // MySQL 8+/Postgres; dropped on SQLite
+)
 
 // Keyset is the "after this row" boundary for keyset scrolling: Values align
 // with Orders; the rendered predicate is the expanded row-value comparison
@@ -71,6 +151,15 @@ func (b *builder) bind(v any) string {
 	return b.d.Placeholder(len(b.args))
 }
 
+func (b *builder) q(ident string) string { return b.d.Quote(ident) }
+
+func (b *builder) finish() (Query, error) {
+	if len(b.args) > b.d.MaxParams() {
+		return Query{}, fmt.Errorf("%w: %d > %d (chunk the input)", ErrTooManyParams, len(b.args), b.d.MaxParams())
+	}
+	return Query{SQL: b.sb.String(), Args: b.args}, nil
+}
+
 // Build renders tree for meta. args are the method arguments in order; a
 // slice argument for In/NotIn is expanded.
 func Build(d Dialect, m *entity.Meta, t *parser.Tree, args []any, opt Options) (Query, error) {
@@ -82,29 +171,34 @@ func Build(d Dialect, m *entity.Meta, t *parser.Tree, args []any, opt Options) (
 	if err != nil {
 		return Query{}, err
 	}
+	table := b.q(m.Table)
 	switch t.Verb {
 	case parser.Count:
-		fmt.Fprintf(&b.sb, "SELECT COUNT(*) FROM %s%s", m.Table, where)
+		fmt.Fprintf(&b.sb, "SELECT COUNT(*) FROM %s%s", table, where)
 	case parser.Exists:
-		fmt.Fprintf(&b.sb, "SELECT EXISTS(SELECT 1 FROM %s%s)", m.Table, where)
+		fmt.Fprintf(&b.sb, "SELECT EXISTS(SELECT 1 FROM %s%s)", table, where)
 	case parser.Delete:
 		if m.SoftDeleteSet != "" && !opt.IncludeDeleted {
 			set := m.SoftDeleteSet
 			for _, c := range m.Columns {
 				if c.Updated {
-					set += ", " + c.Name + " = " + d.Now()
+					set += ", " + b.q(c.Name) + " = " + d.Now()
 				}
 			}
-			fmt.Fprintf(&b.sb, "UPDATE %s SET %s%s", m.Table, set, where)
+			fmt.Fprintf(&b.sb, "UPDATE %s SET %s%s", table, set, where)
 		} else {
-			fmt.Fprintf(&b.sb, "DELETE FROM %s%s", m.Table, where)
+			fmt.Fprintf(&b.sb, "DELETE FROM %s%s", table, where)
 		}
 	default:
 		distinct := ""
 		if t.Distinct {
 			distinct = "DISTINCT "
 		}
-		fmt.Fprintf(&b.sb, "SELECT %s%s FROM %s%s", distinct, strings.Join(m.ColumnNames(), ", "), m.Table, where)
+		cols := make([]string, len(m.Columns))
+		for i, c := range m.Columns {
+			cols[i] = b.q(c.Name)
+		}
+		fmt.Fprintf(&b.sb, "SELECT %s%s FROM %s%s", distinct, strings.Join(cols, ", "), table, where)
 		order := t.OrderBy
 		if len(opt.OrderBy) > 0 {
 			order = opt.OrderBy
@@ -116,9 +210,9 @@ func Build(d Dialect, m *entity.Meta, t *parser.Tree, args []any, opt Options) (
 				if !ok {
 					return Query{}, fmt.Errorf("sqlgen: unknown sort property %q", o.Property)
 				}
-				parts[i] = c.Name + " ASC"
+				parts[i] = b.q(c.Name) + " ASC"
 				if o.Desc {
-					parts[i] = c.Name + " DESC"
+					parts[i] = b.q(c.Name) + " DESC"
 				}
 			}
 			b.sb.WriteString(" ORDER BY " + strings.Join(parts, ", "))
@@ -133,8 +227,11 @@ func Build(d Dialect, m *entity.Meta, t *parser.Tree, args []any, opt Options) (
 		if opt.Offset > 0 {
 			fmt.Fprintf(&b.sb, " OFFSET %d", opt.Offset)
 		}
+		if opt.Lock != NoLock && d.Name() != "sqlite" {
+			b.sb.WriteString(" " + string(opt.Lock))
+		}
 	}
-	return Query{SQL: b.sb.String(), Args: b.args}, nil
+	return b.finish()
 }
 
 func (b *builder) where(m *entity.Meta, t *parser.Tree, args []any, opt Options) (string, error) {
@@ -147,7 +244,7 @@ func (b *builder) where(m *entity.Meta, t *parser.Tree, args []any, opt Options)
 			if !ok {
 				return "", fmt.Errorf("sqlgen: unknown property %q on %s", p.Property, m.Table)
 			}
-			cond, err := b.cond(c.Name, p, args[ai:ai+p.NumArgs])
+			cond, err := b.cond(b.q(c.Name), p, args[ai:ai+p.NumArgs])
 			if err != nil {
 				return "", err
 			}
@@ -240,13 +337,13 @@ func (b *builder) cond(col string, p parser.Part, args []any) (string, error) {
 	case "NotLike":
 		return lhs + " NOT LIKE " + ph(args[0]), nil
 	case "StartingWith":
-		return lhs + " LIKE " + ph(fmt.Sprint(args[0])+"%"), nil
+		return lhs + " LIKE " + ph(EscapeLike(fmt.Sprint(args[0]))+"%"), nil
 	case "EndingWith":
-		return lhs + " LIKE " + ph("%"+fmt.Sprint(args[0])), nil
+		return lhs + " LIKE " + ph("%"+EscapeLike(fmt.Sprint(args[0]))), nil
 	case "Containing":
-		return lhs + " LIKE " + ph("%"+fmt.Sprint(args[0])+"%"), nil
+		return lhs + " LIKE " + ph("%"+EscapeLike(fmt.Sprint(args[0]))+"%"), nil
 	case "NotContaining":
-		return lhs + " NOT LIKE " + ph("%"+fmt.Sprint(args[0])+"%"), nil
+		return lhs + " NOT LIKE " + ph("%"+EscapeLike(fmt.Sprint(args[0]))+"%"), nil
 	case "LessThan":
 		return col + " < " + b.bind(args[0]), nil
 	case "LessThanEqual":
@@ -285,7 +382,11 @@ func Expand(v any) []any {
 func Named(d Dialect, sql string, params map[string]any) (Query, error) {
 	b := &builder{d: d}
 	out, err := b.named(sql, params)
-	return Query{SQL: out, Args: b.args}, err
+	if err != nil {
+		return Query{}, err
+	}
+	b.sb.WriteString(out)
+	return b.finish()
 }
 
 func (b *builder) named(sql string, params map[string]any) (string, error) {
@@ -342,7 +443,7 @@ func (b *builder) keyset(m *entity.Meta, k *Keyset) (string, error) {
 		if !ok {
 			return "", fmt.Errorf("sqlgen: unknown keyset property %q", o.Property)
 		}
-		cols[i] = c.Name
+		cols[i] = b.q(c.Name)
 	}
 	var ors []string
 	for i := range k.Orders {
@@ -417,16 +518,16 @@ func Not(c Cond) Cond                      { return notCond{c} }
 // validated — use for expressions the builder can't express).
 func Raw(sql string, params map[string]any) Cond { return rawCond{sql, params} }
 
-func col(m *entity.Meta, prop string) (string, error) {
+func col(b *builder, m *entity.Meta, prop string) (string, error) {
 	c, ok := m.ResolveProperty(prop)
 	if !ok {
 		return "", fmt.Errorf("sqlgen: unknown property %q on %s", prop, m.Table)
 	}
-	return c.Name, nil
+	return b.q(c.Name), nil
 }
 
 func (c cmp) render(b *builder, m *entity.Meta) (string, error) {
-	n, err := col(m, c.prop)
+	n, err := col(b, m, c.prop)
 	if err != nil {
 		return "", err
 	}
@@ -442,7 +543,7 @@ func (c cmp) render(b *builder, m *entity.Meta) (string, error) {
 }
 
 func (c inCond) render(b *builder, m *entity.Meta) (string, error) {
-	n, err := col(m, c.prop)
+	n, err := col(b, m, c.prop)
 	if err != nil {
 		return "", err
 	}
@@ -465,7 +566,7 @@ func (c inCond) render(b *builder, m *entity.Meta) (string, error) {
 }
 
 func (c nullCond) render(b *builder, m *entity.Meta) (string, error) {
-	n, err := col(m, c.prop)
+	n, err := col(b, m, c.prop)
 	if err != nil {
 		return "", err
 	}
@@ -476,7 +577,7 @@ func (c nullCond) render(b *builder, m *entity.Meta) (string, error) {
 }
 
 func (c between) render(b *builder, m *entity.Meta) (string, error) {
-	n, err := col(m, c.prop)
+	n, err := col(b, m, c.prop)
 	if err != nil {
 		return "", err
 	}
@@ -555,5 +656,6 @@ func Positional(d Dialect, sql string, args []any) (Query, error) {
 	if ai != len(args) {
 		return Query{}, fmt.Errorf("sqlgen: %d arguments for %d placeholders", len(args), ai)
 	}
-	return Query{SQL: out.String(), Args: b.args}, nil
+	b.sb.WriteString(out.String())
+	return b.finish()
 }

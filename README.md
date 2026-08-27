@@ -77,6 +77,22 @@ for w.HasNext { w, _ = repo.FindByWarehouseIdOrderByProductCodeAscIdAsc(ctx, 2, 
 
 Properties are validated against the entity; `jpa.RawCond("price IS NULL OR price > :p", params)` is the unvalidated escape hatch.
 
+## Also in the box
+
+- **Retry**: `jpa.WithRetry(jpa.RetryPolicy{Attempts: 3, Backoff: 20*time.Millisecond, Retryable: jpa.IsDeadlock})` — reads always, writes only with `Writes: true` (must be idempotent).
+- **Hooks**: `jpa.WithDefaultTimeout(d)`, `jpa.Metrics(func(name, dur, rows, err))`, `jpa.SlowQuery(threshold, report)`, or your own `jpa.Hook`.
+- **Locks**: add a trailing `jpa.LockMode` parameter (`jpa.ForUpdate`, `jpa.ForShare`) to a derived method: `FindLockedByProductCode(ctx, code, jpa.ForUpdate)`.
+- **Optimistic locking**: tag a counter `orm:"version"`; `Update` checks and increments it, returning `jpa.ErrOptimisticLock` on conflict.
+- **Batch update**: `repo.BatchUpdate(ctx, []jpa.BatchRow{{Key: {"ProductCode": "A"}, Set: {"Mrp": 9.5}}, …})` renders one CASE-WHEN statement per 500 rows.
+- **Streaming**: `repo.EachBy(ctx, "FindByWarehouseId", func(r T) error { … }, id)`.
+- **Mocks**: `jpagen -type Repository -mock` emits `RepositoryMock` with a func field per method.
+- **CI**: `jpagen … -check` exits 1 when generated files are stale.
+- **Safety**: reserved identifiers are quoted per dialect, `Containing/StartingWith` escape `%`/`_`, and statements over the driver's bind limit fail early with `sqlgen.ErrTooManyParams` (use `jpa.Chunk`).
+- **Dialects**: `sqlgen.MySQL`, `sqlgen.Postgres`, `sqlgen.SQLite`.
+- **Real-database tests**: `make integration` runs the example repository against SQLite, MySQL 8 and Postgres 16 (Docker).
+
+Migrating an existing sqlx/GORM codebase: [`docs/MIGRATION.md`](docs/MIGRATION.md).
+
 ## Runtime
 
 - `jpa.New[T,ID](exec, dialect, opts...)` — `exec` is `*sql.DB` or `*sql.Tx`; dialects `sqlgen.MySQL`, `sqlgen.Postgres`.
@@ -89,5 +105,7 @@ Properties are validated against the entity; `jpa.RawCond("price IS NULL OR pric
 
 ```
 make test        # parser, sqlgen, entity, jpa (sqlmock), example/warehouse (generated code)
+make integration # SQLite + MySQL + Postgres (needs Docker; GOJPA_SKIP_DOCKER=1 for SQLite only)
 make generate    # rerun jpagen
+make lint        # golangci-lint (0 issues expected)
 ```

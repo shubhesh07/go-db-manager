@@ -233,3 +233,94 @@ func TestSelectPage(t *testing.T) {
 		t.Fatalf("%v %+v", err, p)
 	}
 }
+
+type Versioned struct {
+	ID      int64  `db:"id" orm:"pk,auto"`
+	Name    string `db:"name"`
+	Version int64  `db:"version" orm:"version"`
+}
+
+func (*Versioned) TableName() string { return "versioned" }
+
+func TestOptimisticLock(t *testing.T) {
+	db, mock, _ := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherEqual))
+	defer db.Close()
+	r := New[Versioned, int64](db, sqlgen.MySQL)
+	v := &Versioned{ID: 1, Name: "a", Version: 3}
+	mock.ExpectExec("UPDATE versioned SET name = ?, version = version + 1 WHERE id = ? AND version = ?").
+		WithArgs("a", int64(1), int64(3)).WillReturnResult(sqlmock.NewResult(0, 1))
+	if err := r.Update(context.Background(), v); err != nil || v.Version != 4 {
+		t.Fatalf("%v version=%d", err, v.Version)
+	}
+	mock.ExpectExec("UPDATE versioned SET name = ?, version = version + 1 WHERE id = ? AND version = ?").
+		WithArgs("a", int64(1), int64(4)).WillReturnResult(sqlmock.NewResult(0, 0))
+	if err := r.Update(context.Background(), v); !errors.Is(err, ErrOptimisticLock) {
+		t.Fatalf("want ErrOptimisticLock, got %v", err)
+	}
+}
+
+func TestRetry(t *testing.T) {
+	db, mock, _ := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherEqual))
+	defer db.Close()
+	calls := 0
+	r := New[Warehouse, int64](db, sqlgen.MySQL,
+		WithRetry(RetryPolicy{Attempts: 3, Backoff: time.Millisecond, Retryable: IsDeadlock}),
+		WithHook(Metrics(func(string, time.Duration, int64, error) { calls++ })))
+	q := "SELECT " + cols + " FROM medicine_warehouse_master WHERE id = ? AND active = 1 LIMIT 1"
+	mock.ExpectQuery(q).WithArgs(int64(1)).WillReturnError(errors.New("Error 1213: Deadlock found when trying to get lock"))
+	mock.ExpectQuery(q).WithArgs(int64(1)).WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(1))
+	if _, err := r.FindByID(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 {
+		t.Errorf("hook calls = %d, want 2 (one per attempt)", calls)
+	}
+	// writes are not retried unless Writes: true
+	mock.ExpectExec("UPDATE medicine_warehouse_master SET active = 0, updated_on = NOW() WHERE id = ? AND active = 1").
+		WithArgs(int64(1)).WillReturnError(errors.New("Error 1213: Deadlock"))
+	if err := r.DeleteByID(context.Background(), 1); err == nil {
+		t.Error("write must not be retried by default")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Error(err)
+	}
+}
+
+func TestBatchUpdateAndLock(t *testing.T) {
+	r, mock := newRepo(t)
+	ctx := WithActor(context.Background(), int64(9))
+	mock.ExpectExec("UPDATE medicine_warehouse_master SET active = CASE WHEN product_code = ? AND warehouse_id = ? THEN ? ELSE active END, price = CASE WHEN product_code = ? AND warehouse_id = ? THEN ? ELSE price END, updated_by = ?, updated_on = NOW() WHERE (product_code = ? AND warehouse_id = ?) OR (product_code = ? AND warehouse_id = ?)").
+		WithArgs("A", int64(1), true, "B", int64(1), 9.5, int64(9), "A", int64(1), "B", int64(1)).
+		WillReturnResult(sqlmock.NewResult(0, 2))
+	n, err := r.BatchUpdate(ctx, []BatchRow{
+		{Key: map[string]any{"ProductCode": "A", "WarehouseId": int64(1)}, Set: map[string]any{"Active": true}},
+		{Key: map[string]any{"ProductCode": "B", "WarehouseId": int64(1)}, Set: map[string]any{"Price": 9.5}},
+	})
+	if err != nil || n != 2 {
+		t.Fatalf("%v %d", err, n)
+	}
+	if _, err := r.BatchUpdate(ctx, []BatchRow{{Key: map[string]any{"Nope": 1}, Set: map[string]any{"Active": true}}}); err == nil {
+		t.Error("unknown property must fail")
+	}
+	mock.ExpectQuery("SELECT " + cols + " FROM medicine_warehouse_master WHERE id = ? AND active = 1 LIMIT 1 FOR UPDATE").
+		WithArgs(int64(1)).WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(1))
+	if _, err := r.FindOneBy(ctx, "FindById", int64(1), ForUpdate); err != nil {
+		t.Fatal(err)
+	}
+	var seen []int64
+	mock.ExpectQuery("SELECT " + cols + " FROM medicine_warehouse_master WHERE warehouse_id = ? AND active = 1").
+		WithArgs(int64(3)).WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(1).AddRow(2).AddRow(3))
+	err = r.EachBy(ctx, "FindByWarehouseId", func(w Warehouse) error {
+		seen = append(seen, w.ID)
+		if w.ID == 2 {
+			return errors.New("stop")
+		}
+		return nil
+	}, int64(3))
+	if err == nil || len(seen) != 2 {
+		t.Errorf("each: %v %v", err, seen)
+	}
+	if got := Chunk([]int{1, 2, 3, 4, 5}, 2); len(got) != 3 || len(got[2]) != 1 {
+		t.Errorf("chunk: %v", got)
+	}
+}

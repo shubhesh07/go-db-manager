@@ -24,7 +24,7 @@ func (*MedicineWarehouse) TableName() string { return "medicine_warehouse_master
 
 // SoftDelete: catalog-service treats is_searchable as the "active" flag.
 func (*MedicineWarehouse) SoftDelete() (string, string) {
-	return "is_searchable = 1", "is_searchable = 0"
+	return "is_searchable = TRUE", "is_searchable = FALSE"
 }
 
 // Key is the composite business key.

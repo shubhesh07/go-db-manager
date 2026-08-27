@@ -11,6 +11,8 @@
 //	orm:"updated"     set to NOW() on insert and update
 //	orm:"created_by"  set from jpa.WithActor(ctx) on insert
 //	orm:"updated_by"  set from jpa.WithActor(ctx) on insert and update
+//	orm:"version"     optimistic lock counter: Update adds "AND version = ?"
+//	                  and "SET version = version + 1"; 0 rows → ErrOptimisticLock
 //
 // Optional methods on *T:
 //
@@ -39,6 +41,7 @@ type Column struct {
 	Updated   bool
 	CreatedBy bool
 	UpdatedBy bool
+	Version   bool
 }
 
 type Meta struct {
@@ -46,7 +49,8 @@ type Meta struct {
 	Table            string
 	Columns          []Column
 	PK               *Column
-	SoftDeleteFilter string // "" = none
+	Version          *Column // orm:"version", nil if none
+	SoftDeleteFilter string  // "" = none
 	SoftDeleteSet    string
 	byName           map[string]*Column
 }
@@ -83,6 +87,9 @@ func OfType(t reflect.Type) (*Meta, error) {
 		m.byName[c.Name] = c
 		if c.PK {
 			m.PK = c
+		}
+		if c.Version {
+			m.Version = c
 		}
 	}
 	if m.PK == nil {
@@ -139,6 +146,8 @@ func collect(m *Meta, t reflect.Type, prefix []int) {
 				c.CreatedBy = true
 			case "updated_by":
 				c.UpdatedBy = true
+			case "version":
+				c.Version = true
 			}
 		}
 		m.Columns = append(m.Columns, c)

@@ -24,23 +24,23 @@ func TestGenerated(t *testing.T) {
 	r, mock := setup(t)
 	ctx := context.Background()
 
-	mock.ExpectQuery("SELECT "+cols+" FROM medicine_warehouse_master WHERE product_code IN (?, ?) AND warehouse_id IN (?) AND is_searchable = 1").
+	mock.ExpectQuery("SELECT "+cols+" FROM medicine_warehouse_master WHERE product_code IN (?, ?) AND warehouse_id IN (?) AND is_searchable = TRUE").
 		WithArgs("A", "B", int64(2)).WillReturnRows(sqlmock.NewRows([]string{"id", "product_code"}).AddRow(1, "A"))
 	rows, err := r.FindByProductCodeInAndWarehouseIdIn(ctx, []string{"A", "B"}, []int64{2})
 	if err != nil || len(rows) != 1 || rows[0].ProductCode != "A" {
 		t.Fatalf("%v %+v", err, rows)
 	}
 
-	mock.ExpectQuery("SELECT " + cols + " FROM medicine_warehouse_master WHERE warehouse_id = ? AND is_searchable = 1 ORDER BY product_code ASC LIMIT 20").
+	mock.ExpectQuery("SELECT " + cols + " FROM medicine_warehouse_master WHERE warehouse_id = ? AND is_searchable = TRUE ORDER BY product_code ASC LIMIT 20").
 		WithArgs(int64(2)).WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(1))
-	mock.ExpectQuery("SELECT COUNT(*) FROM medicine_warehouse_master WHERE warehouse_id = ? AND is_searchable = 1").
+	mock.ExpectQuery("SELECT COUNT(*) FROM medicine_warehouse_master WHERE warehouse_id = ? AND is_searchable = TRUE").
 		WithArgs(int64(2)).WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(1))
 	page, err := r.FindByWarehouseIdOrderByProductCodeAsc(ctx, 2, jpa.PageRequest(0, 20))
 	if err != nil || page.Total != 1 {
 		t.Fatalf("%v %+v", err, page)
 	}
 
-	mock.ExpectQuery("SELECT COUNT(*) FROM medicine_warehouse_master WHERE warehouse_id = ? AND availability = TRUE AND is_searchable = 1").
+	mock.ExpectQuery("SELECT COUNT(*) FROM medicine_warehouse_master WHERE warehouse_id = ? AND availability = TRUE AND is_searchable = TRUE").
 		WithArgs(int64(2)).WillReturnRows(sqlmock.NewRows([]string{"c"}).AddRow(5))
 	if n, err := r.CountByWarehouseIdAndAvailabilityTrue(ctx, 2); err != nil || n != 5 {
 		t.Fatalf("%v %d", err, n)
@@ -65,7 +65,7 @@ func TestGenerated(t *testing.T) {
 		t.Fatalf("%v %d", err, n)
 	}
 
-	mock.ExpectExec("UPDATE medicine_warehouse_master SET is_searchable = 0, updated_on = NOW() WHERE product_code IN (?) AND is_searchable = 1").
+	mock.ExpectExec("UPDATE medicine_warehouse_master SET is_searchable = FALSE, updated_on = NOW() WHERE product_code IN (?) AND is_searchable = TRUE").
 		WithArgs("A").WillReturnResult(sqlmock.NewResult(0, 1))
 	if n, err := r.DeleteByProductCodeIn(ctx, []string{"A"}); err != nil || n != 1 {
 		t.Fatalf("%v %d", err, n)
@@ -79,7 +79,7 @@ func TestGenerated(t *testing.T) {
 	if err != nil || n != 2 {
 		t.Fatalf("%v %d", err, n)
 	}
-	mock.ExpectQuery("SELECT " + cols + " FROM medicine_warehouse_master WHERE warehouse_id = ? AND is_searchable = 1 ORDER BY product_code ASC, id ASC LIMIT 2").
+	mock.ExpectQuery("SELECT " + cols + " FROM medicine_warehouse_master WHERE warehouse_id = ? AND is_searchable = TRUE ORDER BY product_code ASC, id ASC LIMIT 2").
 		WithArgs(int64(2)).WillReturnRows(sqlmock.NewRows([]string{"id", "product_code"}).AddRow(1, "A"))
 	w, err := r.FindByWarehouseIdOrderByProductCodeAscIdAsc(ctx, 2, jpa.Keyset(1))
 	if err != nil || w.HasNext || len(w.Next.Keys) != 2 {
@@ -96,5 +96,25 @@ func TestGenerated(t *testing.T) {
 
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Error(err)
+	}
+}
+
+func TestMockAndLock(t *testing.T) {
+	m := &RepositoryMock{CountByWarehouseIdAndAvailabilityTrueFunc: func(ctx context.Context, wh int64) (int64, error) { return 42, nil }}
+	var repo Repository = m
+	if n, _ := repo.CountByWarehouseIdAndAvailabilityTrue(context.Background(), 1); n != 42 {
+		t.Errorf("mock: %d", n)
+	}
+	func() {
+		defer func() { _ = recover() }()
+		_, _ = repo.FindByID(context.Background(), 1)
+		t.Error("unset mock func must panic")
+	}()
+
+	r, mock := setup(t)
+	mock.ExpectQuery("SELECT "+cols+" FROM medicine_warehouse_master WHERE product_code = ? AND warehouse_id = ? AND is_searchable = TRUE LIMIT 1 FOR UPDATE").
+		WithArgs("A", int64(2)).WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(1))
+	if _, err := r.FindLockedByProductCodeAndWarehouseId(context.Background(), "A", 2, jpa.ForUpdate); err != nil {
+		t.Fatal(err)
 	}
 }

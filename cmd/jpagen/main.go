@@ -40,6 +40,9 @@ func main() {
 	implName := flag.String("impl", "", "generated struct name (default <type>Impl)")
 	entName := flag.String("entity", "", "entity type (default: from embedded jpa.CRUD[T, ID])")
 	idName := flag.String("id", "", "id type, e.g. int64 or string (with -entity)")
+	mock := flag.Bool("mock", false, "also emit <type>Mock (func-field test double) in <type>_mock.go")
+	mockOnly := flag.Bool("mock-only", false, "emit only the mock (no entity needed)")
+	check := flag.Bool("check", false, "don't write; exit 1 if generated output differs from the files on disk")
 	flag.Parse()
 	if *typeName == "" {
 		flag.Usage()
@@ -51,7 +54,7 @@ func main() {
 	if *implName == "" {
 		*implName = *typeName + "Impl"
 	}
-	if err := run(*dir, *typeName, *ctor, *implName, *entName, *idName); err != nil {
+	if err := run(*dir, *typeName, *ctor, *implName, *entName, *idName, *mock || *mockOnly, *mockOnly, *check); err != nil {
 		fmt.Fprintln(os.Stderr, "jpagen:", err)
 		os.Exit(1)
 	}
@@ -63,7 +66,7 @@ type method struct {
 	doc  []string
 }
 
-func run(dir, name, ctor, impl, entName, idName string) error {
+func run(dir, name, ctor, impl, entName, idName string, mock, mockOnly, check bool) error {
 	outFile := filepath.Join(dir, entity.SnakeCase(name)+"_gen.go")
 	cfg := &packages.Config{Mode: packages.NeedName | packages.NeedTypes | packages.NeedSyntax | packages.NeedTypesInfo | packages.NeedFiles, Dir: dir}
 	pkgs, err := packages.Load(cfg, ".")
@@ -78,6 +81,15 @@ func run(dir, name, ctor, impl, entName, idName string) error {
 	iface, ok := obj.Type().Underlying().(*types.Interface)
 	if !ok {
 		return fmt.Errorf("%s is not an interface", name)
+	}
+
+	if mock {
+		if err := writeMock(dir, pkg, name, iface, check); err != nil {
+			return err
+		}
+		if mockOnly {
+			return nil
+		}
 	}
 
 	// Entity and ID from embedded jpa.CRUD[T, ID].
@@ -158,6 +170,7 @@ func run(dir, name, ctor, impl, entName, idName string) error {
 	fmt.Fprintf(&body, "// %s builds the repository on exec (*sql.DB or *sql.Tx).\nfunc %s(exec jpa.Executor, d sqlgen.Dialect, opts ...jpa.Option) *%s {\n\treturn &%s{Repository: jpa.New[%s, %s](exec, d, append([]jpa.Option{jpa.WithName(%q)}, opts...)...)}\n}\n\n",
 		ctor, ctor, impl, impl, g.typ(entT), g.typ(idT), pkg.Name+"."+name)
 	fmt.Fprintf(&body, "// WithTx returns a copy bound to tx.\nfunc (r *%s) WithTx(exec jpa.Executor) *%s {\n\treturn &%s{Repository: r.Repository.WithTx(exec)}\n}\n\n", impl, impl, impl)
+	fmt.Fprintf(&body, "// IncludingDeleted returns a copy that bypasses the entity's soft-delete filter.\nfunc (r *%s) IncludingDeleted() *%s {\n\treturn &%s{Repository: r.Repository.IncludingDeleted()}\n}\n\n", impl, impl, impl)
 
 	for _, m := range methods {
 		code, err := g.method(impl, m, resolve)
@@ -187,7 +200,103 @@ func run(dir, name, ctor, impl, entName, idName string) error {
 	if err != nil {
 		return fmt.Errorf("format: %w\n%s", err, out.String())
 	}
-	return os.WriteFile(outFile, src, 0o644)
+	return emit(outFile, src, check)
+}
+
+// emit writes src to path, or in check mode compares and reports drift.
+func emit(path string, src []byte, check bool) error {
+	if !check {
+		return os.WriteFile(path, src, 0o644) //nolint:gosec // generated source
+	}
+	cur, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(cur, src) {
+		return fmt.Errorf("%s is stale: run go generate", path)
+	}
+	return nil
+}
+
+// writeMock emits <Name>Mock: a struct with one func field per interface
+// method (including methods promoted from embedded interfaces). Unset funcs
+// panic with the method name so a test fails loudly.
+func writeMock(dir string, pkg *packages.Package, name string, iface *types.Interface, check bool) error {
+	g := &gen{pkg: pkg.Types, imports: map[string]string{}}
+	mockName := name + "Mock"
+	var body bytes.Buffer
+	fmt.Fprintf(&body, "// %s is a test double for %s: set the func fields you need.\n", mockName, name)
+	fmt.Fprintf(&body, "type %s struct {\n", mockName)
+	type m struct {
+		name string
+		sig  *types.Signature
+	}
+	var methods []m
+	for i := 0; i < iface.NumMethods(); i++ {
+		f := iface.Method(i)
+		sig, ok := f.Type().(*types.Signature)
+		if !ok {
+			continue
+		}
+		methods = append(methods, m{f.Name(), sig})
+		fmt.Fprintf(&body, "\t%sFunc %s\n", f.Name(), g.typ(sig))
+	}
+	body.WriteString("}\n\n")
+	fmt.Fprintf(&body, "var _ %s = (*%s)(nil)\n\n", name, mockName)
+	for _, mm := range methods {
+		var params, args, results []string
+		for i := 0; i < mm.sig.Params().Len(); i++ {
+			p := mm.sig.Params().At(i)
+			n := p.Name()
+			if n == "" || n == "_" {
+				n = fmt.Sprintf("p%d", i)
+			}
+			t := g.typ(p.Type())
+			if mm.sig.Variadic() && i == mm.sig.Params().Len()-1 {
+				t = "..." + g.typ(p.Type().(*types.Slice).Elem())
+				n += "..."
+				params = append(params, strings.TrimSuffix(n, "...")+" "+t)
+			} else {
+				params = append(params, n+" "+t)
+			}
+			args = append(args, n)
+		}
+		for i := 0; i < mm.sig.Results().Len(); i++ {
+			results = append(results, g.typ(mm.sig.Results().At(i).Type()))
+		}
+		res := strings.Join(results, ", ")
+		if len(results) > 1 {
+			res = "(" + res + ")"
+		}
+		fmt.Fprintf(&body, "func (m *%s) %s(%s) %s {\n", mockName, mm.name, strings.Join(params, ", "), res)
+		fmt.Fprintf(&body, "\tif m.%sFunc == nil {\n\t\tpanic(\"%s.%s: %sFunc not set\")\n\t}\n", mm.name, mockName, mm.name, mm.name)
+		if len(results) == 0 {
+			fmt.Fprintf(&body, "\tm.%sFunc(%s)\n}\n\n", mm.name, strings.Join(args, ", "))
+		} else {
+			fmt.Fprintf(&body, "\treturn m.%sFunc(%s)\n}\n\n", mm.name, strings.Join(args, ", "))
+		}
+	}
+	var out bytes.Buffer
+	fmt.Fprintf(&out, "// Code generated by jpagen; DO NOT EDIT.\n\npackage %s\n\n", pkg.Name)
+	if len(g.imports) > 0 {
+		out.WriteString("import (\n")
+		paths := make([]string, 0, len(g.imports))
+		for p := range g.imports {
+			paths = append(paths, p)
+		}
+		sort.Strings(paths)
+		for _, p := range paths {
+			if filepath.Base(p) == g.imports[p] {
+				fmt.Fprintf(&out, "\t%q\n", p)
+			} else {
+				fmt.Fprintf(&out, "\t%s %q\n", g.imports[p], p)
+			}
+		}
+		out.WriteString(")\n\n")
+	}
+	out.Write(body.Bytes())
+	src, err := format.Source(out.Bytes())
+	if err != nil {
+		return fmt.Errorf("format mock: %w\n%s", err, out.String())
+	}
+	return emit(filepath.Join(dir, entity.SnakeCase(name)+"_mock.go"), src, check)
 }
 
 func recvName(e ast.Expr) string {
@@ -379,7 +488,7 @@ func (g *gen) body(m method, resolve parser.Resolver, ctx, qname string, argName
 	bind := argNames
 	special := ""
 	if n := len(bind); n > 0 {
-		if t := params.At(n).Type(); isJpa(t, "Pageable") || isJpa(t, "Sort") || isJpa(t, "Limit") || isJpa(t, "ScrollPosition") {
+		if t := params.At(n).Type(); isJpa(t, "Pageable") || isJpa(t, "Sort") || isJpa(t, "Limit") || isJpa(t, "ScrollPosition") || isNamed(t, sqlgenPath, "Lock") {
 			special, bind = bind[n-1], bind[:n-1]
 		}
 	}
@@ -453,7 +562,7 @@ func isPtr(t types.Type) bool           { _, ok := t.(*types.Pointer); return ok
 func isJpa(t types.Type, n string) bool { return isNamed(t, jpaPath, n) }
 
 func isNamed(t types.Type, path, name string) bool {
-	n, ok := t.(*types.Named)
+	n, ok := types.Unalias(t).(*types.Named)
 	return ok && n.Obj().Pkg() != nil && n.Obj().Pkg().Path() == path && n.Obj().Name() == name
 }
 
