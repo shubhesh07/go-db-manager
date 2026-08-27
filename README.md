@@ -35,6 +35,82 @@ err = jpa.Transactional(ctx, db, func(tx *sql.Tx) error { return repo.WithTx(tx)
 
 Full example: [`example/warehouse`](example/warehouse). Design and Spring mapping: [`DESIGN.md`](DESIGN.md).
 
+## Getting started (new project)
+
+Try it first with no database to install — SQLite in memory:
+
+```
+git clone https://github.com/shubhesh07/gojpa && cd gojpa && make quickstart
+```
+
+That runs [`integration/cmd/quickstart`](integration/cmd/quickstart): one entity, one interface, generated implementation, derived + declared queries, paging, soft delete, hooks. Then in your own module:
+
+**1. Install**
+```
+go get github.com/shubhesh07/gojpa
+```
+
+**2. Define the entity** — a plain struct with `db` tags (sqlx convention) and optional `TableName()` / `SoftDelete()`:
+```go
+type Product struct {
+    ID        int64     `db:"id" orm:"pk,auto"`
+    Code      string    `db:"code"`
+    Name      string    `db:"name"`
+    Price     float64   `db:"price"`
+    Active    bool      `db:"active"`
+    UpdatedOn time.Time `db:"updated_on" orm:"updated"`   // set to NOW() on insert/update
+}
+func (*Product) TableName() string { return "product" }
+```
+
+**3. Declare the repository interface** and put a `go:generate` line above it:
+```go
+//go:generate go run github.com/shubhesh07/gojpa/cmd/jpagen -type ProductRepository -mock
+type ProductRepository interface {
+    jpa.CRUD[Product, int64]
+    FindByCode(ctx context.Context, code string) (*Product, error)
+    FindByNameContainingOrderByPriceDesc(ctx context.Context, fragment string) ([]Product, error)
+    FindByActiveTrue(ctx context.Context, p jpa.Pageable) (jpa.Page[Product], error)
+    // jpa:query UPDATE product SET price = price * :factor WHERE code IN (:codes)
+    // jpa:modifying
+    RaisePriceByCodes(ctx context.Context, factor float64, codes []string) (int64, error)
+}
+```
+
+**4. Generate** — produces `product_repository_gen.go` (`ProductRepositoryImpl`, `NewProductRepository`) and `product_repository_mock.go`. Commit both.
+```
+go generate ./...
+```
+A wrong property name or argument count fails here, not at runtime.
+
+**5. Connect** — any `*sql.DB` (or `*sql.Tx`) plus a dialect. Hooks give you timeouts, logging, metrics, retry:
+```go
+repo := NewProductRepository(db, sqlgen.MySQL,          // or sqlgen.Postgres / sqlgen.SQLite
+    jpa.WithDefaultTimeout(3*time.Second),
+    jpa.WithRetry(jpa.RetryPolicy{Attempts: 3, Backoff: 20*time.Millisecond, Retryable: jpa.IsDeadlock}),
+    jpa.WithHook(jpa.Metrics(func(name string, d time.Duration, rows int64, err error) { /* prometheus/otel/zap */ })),
+)
+```
+
+**6. Use it**
+```go
+p, err := repo.FindByCode(ctx, "P1")                    // errors.Is(err, jpa.ErrNotFound) when missing
+page, _ := repo.FindByActiveTrue(ctx, jpa.PageRequest(0, 20, jpa.Asc("Code")))
+err = jpa.Transactional(ctx, db, func(tx *sql.Tx) error { return repo.WithTx(tx).Save(ctx, &Product{...}) })
+```
+
+**7. Test** — unit-test callers with the generated mock; unit-test the repository with [go-sqlmock](https://github.com/DATA-DOG/go-sqlmock) (exact SQL is deterministic); see [`example/warehouse/repository_test.go`](example/warehouse/repository_test.go).
+```go
+m := &ProductRepositoryMock{FindByCodeFunc: func(ctx context.Context, c string) (*Product, error) { return &Product{Code: c}, nil }}
+```
+
+**8. CI** — fail the build when generated files are stale:
+```
+go run github.com/shubhesh07/gojpa/cmd/jpagen -type ProductRepository -mock -check
+```
+
+Adding gojpa to an existing sqlx/GORM service without touching callers: [`docs/MIGRATION.md`](docs/MIGRATION.md).
+
 ## Entities
 
 ```go
